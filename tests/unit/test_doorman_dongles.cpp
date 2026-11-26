@@ -30,6 +30,7 @@ struct Interface {
   std::string path;
   std::wstring serial;
   int number = 0;
+  unsigned short firmware = 0x002A;   // the USB bcdDevice: five interfaces from 0x002B
 };
 struct Handle {
   std::string path;
@@ -96,6 +97,7 @@ hid_device_info* HID_API_CALL hid_enumerate(unsigned short, unsigned short) {
     d.serial_number = const_cast<wchar_t*>(fake::plugged[i].serial.c_str());
     d.product_string = const_cast<wchar_t*>(L"Doorman Dongle Pro Micro");   // board-named, matched by prefix
     d.interface_number = fake::plugged[i].number;
+    d.release_number = fake::plugged[i].firmware;
     d.next = i + 1 < fake::listed.size() ? &fake::listed[i + 1] : nullptr;
   }
   return fake::listed.empty() ? nullptr : fake::listed.data();
@@ -352,10 +354,26 @@ TEST(DoormanFind, InterfacesAreGroupedBySerialWhateverTheOrder) {
   const auto found = lh::usb::ScanDoormanDongles(&shared);
   ASSERT_EQ(found.size(), 2u);
   EXPECT_EQ(found[0].serial, "OHDG-TESTA");
-  EXPECT_EQ(found[0].paths, (std::array<std::string, 4>{"A0", "A1", "A2", "A3"}));
+  EXPECT_EQ(found[0].paths, (std::array<std::string, 5>{"A0", "A1", "A2", "A3", ""}));
   EXPECT_EQ(found[1].serial, "OHDG-TESTB");
-  EXPECT_EQ(found[1].paths, (std::array<std::string, 4>{"B0", "B1", "B2", "B3"}));
+  EXPECT_EQ(found[1].paths, (std::array<std::string, 5>{"B0", "B1", "B2", "B3", ""}));
   EXPECT_TRUE(shared.empty());
+  fake::Reset();
+}
+
+TEST(DoormanFind, FiveInterfacesFromFirmware002B) {
+  fake::Reset();
+  // A five-interface dongle waits for its fifth; a four-interface one never needs it.
+  for (int i = 0; i < 4; ++i) fake::plugged.push_back({"N" + std::to_string(i), L"NEW", i, 0x002B});
+  for (int i = 0; i < 4; ++i) fake::plugged.push_back({"O" + std::to_string(i), L"OLD", i, 0x002A});
+  auto found = lh::usb::ScanDoormanDongles(nullptr);
+  ASSERT_EQ(found.size(), 1u);
+  EXPECT_EQ(found[0].serial, "OHDG-OLD");
+  fake::plugged.push_back({"N4", L"NEW", 4, 0x002B});
+  found = lh::usb::ScanDoormanDongles(nullptr);
+  ASSERT_EQ(found.size(), 2u);
+  EXPECT_EQ(found[0].serial, "OHDG-NEW");
+  EXPECT_EQ(found[0].paths, (std::array<std::string, 5>{"N0", "N1", "N2", "N3", "N4"}));
   fake::Reset();
 }
 

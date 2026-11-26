@@ -46,7 +46,7 @@ responses win: 6 devices × 120 B = 6.3 ms cycle, ~18 kB/s each against ~8 kB/s 
 other limit: one 64 B report per ms per HID interface, hence two interfaces (even/odd slots). Realistic
 ceiling ≈ 8 devices per dongle (needs `DML_SLOTS` and the USB split changed); 16–20 only with worse latency.
 
-## Hop channel set (0x002B)
+## Hop channel set (this fork)
 
 `allow_mask` (cmd 0x36; saved in the pairing page after the names, magic "OHHC") bounds adaptive
 hopping, so dongles side by side can take sets with no channel in common (`protocol.md`, "Several

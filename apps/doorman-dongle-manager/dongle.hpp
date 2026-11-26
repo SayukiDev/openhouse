@@ -140,7 +140,7 @@ class Dongle {
   void Ident(int slot);
 
   const std::string path_, serial_;
-  static constexpr int kInterfaces = 4;   // interface 0: commands; slot s streams on interface s % 4
+  static constexpr int kInterfaces = 5;   // interface 0: commands; slot s streams on interface s % 5 (s % 4 before fw 0x002B)
   void* dev0_ = nullptr;                   // hid_device*: devs_[0]
   void* devs_[kInterfaces] = {};
   uint8_t seq_ = 0;

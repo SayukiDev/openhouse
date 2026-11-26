@@ -527,6 +527,7 @@ std::vector<UsbTransport::Receiver> UsbTransport::Receivers() const {
       r.rssiDongle = st.rssiDongle; r.rssiDevice = st.rssiDevice; r.devicesOnDongle = st.devicesOnDongle;
       r.paired = st.used;
       r.name = st.name; r.keepsName = st.haveName;
+      r.firmware = st.dongleFirmware; r.radio = st.radio; r.firmwareOld = st.dongleOld; r.radioOld = st.radioOld;
       slots.push_back(r);
     }
   }

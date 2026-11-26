@@ -28,6 +28,9 @@
 #pragma once
 #include <stdint.h>
 #include <string.h>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 /* Called between coded fields: the radio checks for a POLL's address there (it has no interrupts,
    and a coded frame took ~400 us on the Tracker 1.0's nRF51 before the bit writer was sped up). */
 #ifndef DMC_YIELD
@@ -76,8 +79,8 @@ static inline uint32_t dmc_get(dmc_r_t *r, int n)
   }
   return v;
 }
-#if defined(_MSC_VER) && !defined(__clang__)   /* no __builtin_clz: the host build only (air_experiment.hpp) */
-static inline int dmc_bits32(uint32_t v) { int n = 0; while (v) { n++; v >>= 1; } return n; }
+#ifdef _MSC_VER
+static inline int dmc_bits32(uint32_t v) { unsigned long idx; return _BitScanReverse(&idx, v) ? (int)(idx + 1) : 0; }
 #else
 static inline int dmc_bits32(uint32_t v) { return v ? 32 - __builtin_clz(v) : 0; }
 #endif

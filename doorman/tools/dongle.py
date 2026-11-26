@@ -172,7 +172,7 @@ def channels():
     if allow and allow != 0xFFFF: print(f"kept to hop channel set {allow:#06x} ({bin(allow).count('1')} of 16)")
 
 def hop(a):
-    """Hop channel set (cmd 0x36, firmware 0x002B+): op 0xFF query, 0 saved, 1 for now, 2 saved too."""
+    """Hop channel set (cmd 0x36, this fork's firmware): op 0xFF query, 0 saved, 1 for now, 2 saved too."""
     h = open_dev()
     if not a: st, d = cmd(h, 0x36, bytes([0xFF]))
     elif a[0] == "saved": st, d = cmd(h, 0x36, bytes([0]))
@@ -180,7 +180,7 @@ def hop(a):
         m = {"even": 0x5555, "odd": 0xAAAA, "all": 0xFFFF}.get(a[0])
         if m is None: m = int(a[0], 0)
         st, d = cmd(h, 0x36, bytes([2 if len(a) > 1 and a[1] == "save" else 1, m & 0xFF, m >> 8]))
-    if st == 1: sys.exit("this firmware has no hop channel sets (needs 0x002B)")
+    if st == 1: sys.exit("this firmware has no hop channel sets (it is not in upstream's firmware)")
     if st: sys.exit("not a set of at least 4 of the 16 hop channels")
     now, saved, mask = struct.unpack_from("<3H", d)
     print(f"hop channels: {now:#06x} now, {saved:#06x} saved; in use {mask:#06x} ({bin(mask).count('1')} on)")

@@ -34,10 +34,11 @@
 #pragma once
 #include <stdint.h>
 
-#ifdef DML_IDX                                /* Valve nRF52 radios: SteamVR reads this as a unix time; */
-#define DML_VERSION        0x6A000026u        /* keep it newer than Valve's (0x5D27B2A9) so nothing "updates" it back */
+#include "doorman_versions.h"
+#ifdef DML_IDX
+#define DML_VERSION        DML_VERSION_IDX
 #else
-#define DML_VERSION        0x0A000017u
+#define DML_VERSION        DML_VERSION_HTC
 #endif        /* radio fw version reported for 'X' (HTC: 0x576B0104) */
 #define DML_AIR_UPD        0xF0u              /* downlink/uplink frame op: radio's own updater */
 #define DML_JOIN_CHANNEL   80                 /* 2480 MHz */

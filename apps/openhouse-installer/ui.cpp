@@ -661,6 +661,31 @@ bool RadioNeedsUpdate(const DongleSlot& s) {
   return v && s.device.radioVersion != v;
 }
 
+// An off device's remembered radio is ours and differs from this package's.
+bool StoredRadioNeedsUpdate(const DongleSlot& s) {
+  if (!s.paired || s.answered || !IsDoormanRadio(s.storedRadio)) return false;
+  const RadioFamily family = s.storedRadio >> 24 == 0x6A ? RadioFamily::Newer : RadioFamily::Tracker10;
+  const uint32_t v = OurRadioVersion(family);
+  return v && s.storedRadio != v;
+}
+
+// The dongles, each with how many of its connected devices' radios have an update (Home, the pick page).
+std::vector<DoormanDongleInfo> FindDongleUpdates() {
+  auto dongles = FindDoormanDongles();
+  for (auto& d : dongles) {
+    int n = 0;
+    for (const auto& s : ScanDongleSlots(d)) n += RadioNeedsUpdate(s) || StoredRadioNeedsUpdate(s);
+    d.oldRadios = n;
+  }
+  return dongles;
+}
+
+// The dongle's firmware or one of its devices' radios differs from this package's.
+bool HasUpdate(const DoormanDongleInfo& d) {
+  const uint16_t packaged = PackagedDongleVersion();
+  return (packaged && d.firmware != packaged) || d.oldRadios > 0;
+}
+
 fs::path DongleImage(bool softDevice) {
   return FirmwareFolder() / "dongle" / (softDevice ? "doorman-dongle-sd.uf2" : "doorman-dongle-nosd.uf2");
 }
@@ -1071,12 +1096,11 @@ void Ui::Home() {
   Prompt("What would you like to do?");
   // Doorman Dongles on other firmware than this package's.
   if (!homeWatching_) {
-    homeDongles_.Start(FindDoormanDongles, 3.0);
+    homeDongles_.Start(FindDongleUpdates, 5.0);
     homeWatching_ = true;
   }
-  const uint16_t packaged = PackagedDongleVersion();
   int outdated = 0;
-  for (const auto& d : homeDongles_.Value()) outdated += packaged && d.firmware != packaged;
+  for (const auto& d : homeDongles_.Value()) outdated += HasUpdate(d);
   static std::string installSub;
   static char dongleSub[64];
   const bool installed = status_.openhouse;
@@ -1085,8 +1109,8 @@ void Ui::Home() {
   if (replaced) installSub = "SteamVR replaced the openhouse driver";
   else if (!installed) installSub = std::string("Installs openhouse v") + lh::kVersion + " to SteamVR";
   else installSub = std::string(newer ? "Updates openhouse to v" : "Installs openhouse v") + lh::kVersion + (newer ? "" : " again");
-  if (outdated) std::snprintf(dongleSub, sizeof dongleSub, outdated == 1 ? "A dongle has an update" : "%d dongles have an update", outdated);
-  else std::snprintf(dongleSub, sizeof dongleSub, "No update available");
+  if (outdated) std::snprintf(dongleSub, sizeof dongleSub, "Update available");
+  else std::snprintf(dongleSub, sizeof dongleSub, homeDongles_.Have() ? "Up to date" : "Dongles and their devices");
   const std::vector<TileSpec> tiles{
       replaced ? TileSpec{Icon::Wrench, "Repair Driver", installSub.c_str(), Tint::Yellow}
                : TileSpec{installed ? (newer ? Icon::Download : Icon::Refresh) : Icon::Download,
@@ -1098,7 +1122,7 @@ void Ui::Home() {
       {Icon::Chip, "Install or Update Firmware", "For base stations, dongles, trackers and controllers"},
       {Icon::Restore, "Restore Firmware", "Puts the original firmware back"},
       {Icon::Dongle, "Update Dongles", dongleSub, outdated ? Tint::Yellow : Tint::None}};
-  switch (TileRows(tiles, {false, !installed && !replaced, false, false, false, outdated == 0})) {
+  switch (TileRows(tiles, {false, !installed && !replaced, false, false, false, false})) {
     case 0: Go(Page::Install); break;
     case 1: Go(Page::Uninstall); break;
     case 2: Go(Page::Tools); break;
@@ -1239,6 +1263,11 @@ void Ui::StartAutoInstall() {
   Go(Page::Install);
 }
 
+void Ui::StartDongleUpdate() {
+  autoInstall_ = true;   // the user agreed to close VR in the overlay's warning
+  Go(Page::DongleUpdatePick);
+}
+
 void Ui::StartAutoUninstall() {
   autoInstall_ = true;
   Go(Page::Uninstall);
@@ -1247,12 +1276,11 @@ void Ui::StartAutoUninstall() {
 // After installing: Doorman Dongles on older firmware than this package's.
 void Ui::DongleUpdateOffer() {
   if (!homeWatching_) {
-    homeDongles_.Start(FindDoormanDongles, 3.0);
+    homeDongles_.Start(FindDongleUpdates, 5.0);
     homeWatching_ = true;
   }
-  const uint16_t packaged = PackagedDongleVersion();
   int outdated = 0;
-  for (const auto& d : homeDongles_.Value()) outdated += packaged && d.firmware != packaged;
+  for (const auto& d : homeDongles_.Value()) outdated += HasUpdate(d);
   // OPENHOUSE_TEST_DONGLE_OUTDATED (testing): as if a dongle had older firmware.
   if (std::getenv("OPENHOUSE_TEST_DONGLE_OUTDATED")) outdated = std::max(outdated, 1);
   if (!outdated) return;
@@ -2040,27 +2068,27 @@ void Ui::RadioWirelessPage(bool restore) {
 void Ui::DongleUpdatePick() {
   Title("Update Dongles");
   if (!homeWatching_) {
-    homeDongles_.Start(FindDoormanDongles, 2.0);
+    homeDongles_.Start(FindDongleUpdates, 5.0);
     homeWatching_ = true;
   }
-  const uint16_t packaged = PackagedDongleVersion();
   Prompt("Select the dongle");
   ImGui::Spacing();
   int shown = 0;
   for (const auto& d : homeDongles_.Value()) {
-    if (!packaged || d.firmware == packaged) continue;
     ++shown;
+    const bool update = HasUpdate(d);
     char sub[96];
-    std::snprintf(sub, sizeof sub, "Firmware %04X, this package has %04X", d.firmware, packaged);
+    if (update) std::snprintf(sub, sizeof sub, "Update available (firmware %04X)", d.firmware);
+    else std::snprintf(sub, sizeof sub, "Up to date (firmware %04X)", d.firmware);
     const std::string title = "Doorman Dongle " + d.serial;
     ImGui::PushID(d.serial.c_str());
-    if (TileGrid({{Icon::Dongle, title.c_str(), sub, Tint::Yellow}}, 1) == 0) {   // sized to its text
+    if (TileGrid({{Icon::Dongle, title.c_str(), sub, update ? Tint::Yellow : Tint::None}}, 1) == 0) {   // sized to its text
       updateDongle_ = d;
       Go(Page::DongleUpdate);
     }
     ImGui::PopID();
   }
-  if (!shown) ImGui::TextColored(kMuted, homeDongles_.Have() ? "Every dongle is up to date" : "Looking for dongles...");
+  if (!shown) ImGui::TextColored(kMuted, homeDongles_.Have() ? "No Doorman Dongles plugged in" : "Looking for dongles...");
   Back(Page::Home);
 }
 
@@ -2159,11 +2187,13 @@ void Ui::DongleUpdatePage() {
   }
   if (!started) slots = updateSlots_.Value();
   const bool have = started || updateSlots_.Have();
-  int paired = 0, off = 0, outdated = 0;
+  int paired = 0, off = 0, outdated = 0, offOld = 0, offUnknown = 0;
   for (const auto& s : slots) {
     paired += s.paired;
     off += s.paired && !s.answered;
     outdated += RadioNeedsUpdate(s);
+    offOld += StoredRadioNeedsUpdate(s);
+    offUnknown += s.paired && !s.answered && !s.storedRadio;   // older dongles don't remember radios
   }
   if (!started) {
     ImGui::TextUnformatted("Turn on all the devices paired to this dongle, so their radios are updated too.");
@@ -2209,7 +2239,12 @@ void Ui::DongleUpdatePage() {
         const ImVec4 c = r->second.state == 2 ? kGood : r->second.state == 3 ? kBad : kWarn;
         row(label, c, name, c, r->second.text);
       } else if (!s->answered) {
-        row(label, grey, name, grey, started ? "Was off: not updated" : "Off: turn it on");
+        char text[96];
+        if (started) std::snprintf(text, sizeof text, "Was off: not updated");
+        else if (StoredRadioNeedsUpdate(*s)) std::snprintf(text, sizeof text, "Off, needs an update (radio %08X): turn it on", s->storedRadio);
+        else if (s->storedRadio) std::snprintf(text, sizeof text, "Off, up to date");
+        else std::snprintf(text, sizeof text, "Off: turn it on");
+        row(label, StoredRadioNeedsUpdate(*s) && !started ? kWarn : grey, name, StoredRadioNeedsUpdate(*s) && !started ? kWarn : grey, text);
       } else if (needs) {
         char text[64];
         std::snprintf(text, sizeof text, "Needs an update (radio %08X)", s->device.radioVersion);
@@ -2247,23 +2282,41 @@ void Ui::DongleUpdatePage() {
     Back(Page::DongleUpdatePick);
     return;
   }
-  // Every paired device on and up to date: only the dongle is left, so it starts on its own.
-  if (have && off == 0 && outdated == 0) {
-    StartDongleUpdate(slots);
-    return;
-  }
+  const uint16_t packaged = PackagedDongleVersion();
+  const bool dongleOld = packaged && updateDongle_.firmware != packaged;
+  const bool something = dongleOld || outdated > 0 || offOld > 0;   // the Update button needs something to update
+  if (have && !something && off == 0) ImGui::TextColored(kGood, "Everything on this dongle is up to date");
   const float w = std::min(fs * 34, ImGui::GetContentRegionAvail().x);
   ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.f, (ImGui::GetContentRegionAvail().x - w) / 2));
   char sub[96];
-  if (off) std::snprintf(sub, sizeof sub, "%d of %d devices are off", off, paired);
-  else std::snprintf(sub, sizeof sub, "%d device%s, then the dongle", outdated, outdated == 1 ? "" : "s");
-  ImGui::BeginDisabled(!have);
+  if (!have) std::snprintf(sub, sizeof sub, "Looking for devices...");
+  else if (!something) std::snprintf(sub, sizeof sub, off ? "Nothing to update (%d of %d devices are off)" : "Nothing to update", off, paired);
+  else if (offOld) std::snprintf(sub, sizeof sub, "%d device%s to update %s off", offOld, offOld == 1 ? "" : "s", offOld == 1 ? "is" : "are");
+  else if (off) std::snprintf(sub, sizeof sub, "%d of %d devices are off", off, paired);
+  else if (!outdated) std::snprintf(sub, sizeof sub, "The dongle");
+  else std::snprintf(sub, sizeof sub, dongleOld ? "%d device%s, then the dongle" : "%d device%s", outdated, outdated == 1 ? "" : "s");
+  ImGui::BeginDisabled(!have || !something);
   const bool go = Tile({Icon::Download, "Update", sub, off ? Tint::Yellow : Tint::Green}, w, fs * 5, true);
   ImGui::EndDisabled();
   if (off && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
     ImGui::SetTooltip("Turning on all the devices is recommended! If a device does not automatically connect after updating, "
                       "you can update that device via a cable through the flashing menu!");
-  if (go) StartDongleUpdate(slots);
+  // Devices that need the update (or might: not remembered) are off: they'd be left behind.
+  if (go && (offOld || offUnknown)) ImGui::OpenPopup("Devices off");
+  else if (go) StartDongleUpdate(slots);
+  ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+  if (ImGui::BeginPopupModal("Devices off", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
+    ImGui::PushTextWrapPos(fs * 30);
+    ImGui::TextColored(kWarn, "%s", offOld ? "Devices that need to be updated are not turned on."
+                                           : "Some devices are off and their radio versions are unknown.");
+    ImGui::TextUnformatted("It is recommended to turn on those devices to update everything together. Are you sure you want to continue?");
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    if (BigButton("Continue", fs * 9)) { ImGui::CloseCurrentPopup(); StartDongleUpdate(slots); }
+    ImGui::SameLine();
+    if (BigButton("Cancel", fs * 9)) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+  }
   Back(Page::DongleUpdatePick);
 }
 

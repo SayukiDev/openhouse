@@ -64,6 +64,7 @@ int Run(const std::string& mode) {
     if (mode == "--update") ui.StartSelfUpdate();
     else if (mode == "--install" || mode == "--repair") ui.StartAutoInstall();
     else if (mode == "--uninstall") ui.StartAutoUninstall();
+    else if (mode == "--dongles") ui.StartDongleUpdate();
     const char* snapshot = std::getenv("OPENHOUSE_INSTALLER_SNAPSHOT");
     int frame = 0;
     while (!glfwWindowShouldClose(window) && !ui.QuitRequested()) {
@@ -109,7 +110,8 @@ int Run(const std::string& mode) {
 
 // --update (the overlay's Update / Reinstall): download the latest release and hand over to its
 // installer; --install (that installer) and --repair (the overlay's Fix, from the package kept at
-// install): install right away; --uninstall (its Uninstall openhouse): uninstall right away.
+// install): install right away; --uninstall (its Uninstall openhouse): uninstall right away;
+// --dongles (the overlay's firmware warning): the dongle update, closing SteamVR / Monado for it.
 int main(int argc, char** argv) {
   lh::crash::Install("openhouse-installer");
   return Run(argc > 1 ? argv[1] : "");

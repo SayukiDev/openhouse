@@ -30,17 +30,18 @@ for package in openvr glfw systemd; do
 done
 find "$out/lh-licenses" -xtype l -delete  # a link whose target wasn't there
 # Every app stands alone (liblh's code is built in); none keeps the build directory as its RUNPATH.
-for app in lhtool lhcapture lhviz openhouse-viewer openhouse-overlay doorman-dongle-manager; do
+for app in lhtool lhcapture lhviz lhsession openhouse-viewer openhouse-overlay doorman-dongle-manager; do
   cp "$build/$app" "$out/apps/"
   strip "$out/apps/$app"
   patchelf --remove-rpath "$out/apps/$app"
 done
 # The apps' menu logos (the installer's menu entries).
-cp "$repo/cmake/linux/openhouse.png" "$repo/cmake/linux/dongle-manager.png" "$out/apps/"
+mkdir -p "$out/apps/icons"
+cp "$repo/cmake/linux/openhouse.png" "$repo/cmake/linux/dongle-manager.png" "$out/apps/icons/"
 # ShayBox's Lighthouse library: the overlay's channel changes over Bluetooth (installed next to it).
 python3 "$repo/scripts/fetch-lighthouse-ble.py" linux "$out/apps" > /dev/null
 # Runnable straight out of the archive.
-chmod 755 "$out/openhouse-installer" "$out"/apps/*
-chmod 644 "$out"/apps/*.png
+chmod 755 "$out/openhouse-installer" "$out"/apps/* "$out/apps/icons"
+chmod 644 "$out"/apps/icons/*.png
 tar czf "$repo/dist/openhouse-linux-x64.tar.gz" -C "$repo/dist" openhouse-linux-x64
 echo "Packaged $repo/dist/openhouse-linux-x64.tar.gz"

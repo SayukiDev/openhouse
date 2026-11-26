@@ -95,7 +95,7 @@ class DoormanDongle {
     dev0_ = hid_open_path(path.c_str());
     if (!dev0_) return;
     devs_[0] = dev0_;
-    // The other interfaces carry the slots' streams (slot s on interface s % 4).
+    // The other interfaces carry the slots' streams (slot s on interface s % 5; s % 4 before fw 0x002B).
     if (hid_device_info* list = hid_enumerate(kDoormanVid, kDoormanPid)) {
       wchar_t serial[64]{};
       hid_get_serial_number_string(dev0_, serial, 64);
@@ -228,7 +228,7 @@ class DoormanDongle {
       i += 1 + m;
     }
   }
-  static constexpr int kInterfaces = 4;   // interface 0: commands; slot s streams on interface s % 4
+  static constexpr int kInterfaces = 5;   // interface 0: commands; slot s streams on interface s % 5 (s % 4 before fw 0x002B)
   hid_device* dev0_ = nullptr;
   hid_device* devs_[kInterfaces] = {};
   uint8_t seq_ = 0;
@@ -647,6 +647,11 @@ std::vector<DongleSlot> ScanDongleSlots(const DoormanDongleInfo& dongle) {
   uint8_t r[62];
   for (int slot = 0; slot < n; ++slot) {
     const uint8_t first = uint8_t(slot / 6 * 6);   // 6 slots per reply
+    if (slot == 0 && dongle.firmware >= 0x002C) {   // the radios it remembers: [n][u32 per slot]
+      uint8_t v[62];
+      if (d.Command(0x38, nullptr, 0, v))
+        for (int k = 0; k < std::min<int>(v[1], n) && 2 + 4 * k + 4 <= 62; ++k) out[size_t(k)].storedRadio = Rd32(v + 2 + 4 * k);
+    }
     if (slot == first && !d.Command(0x25, &first, 1, r)) { slot = first + 5; continue; }
     const uint8_t* e = r + 1 + (slot - first) * 10;  // [used][active][8-byte id]
     DongleSlot& s = out[size_t(slot)];

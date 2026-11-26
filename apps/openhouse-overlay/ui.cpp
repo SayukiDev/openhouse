@@ -318,6 +318,7 @@ void Ui::Sidebar(float height) {
   ImGui::EndGroup();
   ImGui::TextDisabled("v%s", lh::kVersion);
   UpdateCard();
+  FirmwareCard();
   ImGui::Spacing();
   ImGui::Separator();
   ImGui::Spacing();
@@ -435,6 +436,30 @@ void Ui::UpdateCard() {
   if (ImGui::Button("Ignore", ImVec2(ignore, 0))) ActOnNotice(NoticeAction::Ignore);
 }
 
+// A dongle or device radio older than the installed openhouse's firmware: a card under the update one.
+void Ui::FirmwareCard() {
+  const NoticeState n = Notice();
+  if (n.kind != NoticeKind::Firmware || (n.handled && n.error.empty())) return;
+  ImGui::Spacing();
+  ImGui::TextColored(kWarn, "Firmware update needed");
+  ImGui::PushTextWrapPos(0);
+  ImGui::TextDisabled("%s", n.tag.c_str());
+#ifndef _WIN32
+  ImGui::TextUnformatted("Please run the installer and update your Doorman devices through the \"Update Dongles\" menu!");
+#endif
+  ImGui::PopTextWrapPos();
+  if (!n.error.empty()) ImGui::TextColored(kBad, "%s", n.error.c_str());
+#ifdef _WIN32
+  const float ignore = ImGui::CalcTextSize("Ignore").x + ImGui::GetStyle().FramePadding.x * 2;
+  if (ImGui::Button("Update", ImVec2(ImGui::GetContentRegionAvail().x - ignore - ImGui::GetStyle().ItemSpacing.x, 0)))
+    confirm_ = true;
+  ImGui::SameLine();
+  if (ImGui::Button("Ignore", ImVec2(ignore, 0))) ActOnNotice(NoticeAction::Ignore);
+#else
+  if (ImGui::Button("OK", ImVec2(ImGui::GetContentRegionAvail().x, 0))) ActOnNotice(NoticeAction::Ignore);
+#endif
+}
+
 // A SteamVR update replaced the driver: across the top, above the sidebar and the page (which
 // get what's left, so nothing is covered).
 void Ui::ReplacedBanner() {
@@ -487,12 +512,14 @@ void Ui::NoticePopups() {
   if (ImGui::BeginPopupModal("Confirm", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
     ImGui::PushFont(g_title);
     const bool remove = replaced && uninstall_;
-    ImGui::TextUnformatted(remove ? "Uninstall openhouse?" : replaced ? "Fix openhouse?" : ("Update openhouse to " + n.tag + "?").c_str());
+    const bool firmware = n.kind == NoticeKind::Firmware;
+    ImGui::TextUnformatted(remove ? "Uninstall openhouse?" : replaced ? "Fix openhouse?" : firmware ? "Update the firmware?"
+                                                                                       : ("Update openhouse to " + n.tag + "?").c_str());
     ImGui::PopFont();
     ImGui::TextColored(kWarn, "VR will shut down. These will be closed:");
     ImGui::TextUnformatted(ClosingText(inVR_).c_str());
     if (remove) ImGui::TextDisabled("Your room and settings are kept");
-    else if (!replaced) ImGui::TextDisabled("The changelog opens on your desktop");
+    else if (!replaced && !firmware) ImGui::TextDisabled("The changelog opens on your desktop");
     ImGui::Spacing();
     if (BigButton(remove ? "Uninstall" : replaced ? "Fix" : "Update", w)) {
       ActOnNotice(remove ? NoticeAction::Uninstall : NoticeAction::Update);
@@ -752,6 +779,12 @@ void Ui::Devices() {
   Tip("Not tracked while off");
   if (changed)
     Send(json{{"cmd", "enable"}, {"serial", d->serial}, {"enabled", enabled}}.dump(), (enabled ? "Enable " : "Disable ") + d->serial);
+  if (d->role != "hmd") {   // a headset without its IMU would shake the view
+    bool imuOff = d->imuDisabled;
+    if (ImGui::Checkbox("Disable IMU (optical only, use only if faulty IMU)", &imuOff))
+      Send(json{{"cmd", "imu"}, {"serial", d->serial}, {"enabled", !imuOff}}.dump(), (imuOff ? "IMU off " : "IMU on ") + d->serial);
+    Tip("For a device with a broken IMU");
+  }
   ImGui::SeparatorText("Light");
   if (d->coverage.empty()) ImGui::TextDisabled("None");
   for (const auto& c : d->coverage) {
@@ -967,15 +1000,21 @@ void Ui::Dongles() {
     ImGui::PushID(dongle.c_str());
     ImGui::SeparatorText(("Doorman " + dongle).c_str());
     ImGui::TextDisabled("%d connected, %d paired, %.1f kB/s", linked, paired, kbps);
+    if (const int fw = slots.front()->firmware) {
+      ImGui::SameLine();
+      if (slots.front()->firmwareOld) ImGui::TextColored(kWarn, "Firmware %04X, needs an update", fw);
+      else ImGui::TextDisabled("Firmware %04X", fw);
+    }
     const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp |
                                   ImGuiTableFlags_PadOuterX;
-    if (ImGui::BeginTable("slots", 7, flags)) {
+    if (ImGui::BeginTable("slots", 8, flags)) {
       ImGui::TableSetupColumn("Slot", ImGuiTableColumnFlags_WidthFixed, em * 2.5f);
       ImGui::TableSetupColumn("Device", ImGuiTableColumnFlags_WidthStretch);
       ImGui::TableSetupColumn("Signal", ImGuiTableColumnFlags_WidthFixed, em * 8.5f);
       ImGui::TableSetupColumn("Loss", ImGuiTableColumnFlags_WidthFixed, em * 3.5f);
       ImGui::TableSetupColumn("Drops", ImGuiTableColumnFlags_WidthFixed, em * 3.5f);
       ImGui::TableSetupColumn("Data", ImGuiTableColumnFlags_WidthFixed, em * 5.5f);
+      ImGui::TableSetupColumn("Radio", ImGuiTableColumnFlags_WidthFixed, em * 5.5f);
       ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, em * 3.2f);
       ImGui::TableHeadersRow();
       for (const Receiver* r : slots) {
@@ -1006,6 +1045,12 @@ void Ui::Dongles() {
         ImGui::TableNextColumn();
         if (!r->linked) ImGui::TextDisabled("-");
         else ImGui::Text("%.1f kB/s", r->kBytesPerSec);
+        ImGui::TableNextColumn();
+        if (!r->radio) ImGui::TextDisabled("-");
+        else if (r->radioOld) {
+          ImGui::TextColored(kWarn, "%08X", r->radio);
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Needs an update");
+        } else ImGui::TextDisabled("%08X", r->radio);
         ImGui::TableNextColumn();
         pairButton(*r);
         ImGui::PopID();

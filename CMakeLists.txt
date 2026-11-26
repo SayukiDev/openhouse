@@ -158,7 +158,7 @@ if(LH_BUILD_USB)
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/transport/usb>
     $<$<BOOL:${HIDAPI_PARENT_DIR}>:$<BUILD_INTERFACE:${HIDAPI_PARENT_DIR}>>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-  target_include_directories(lh_usb PRIVATE src)
+  target_include_directories(lh_usb PRIVATE src doorman/common)   # doorman_versions.h
   target_link_libraries(lh_usb PUBLIC lh_common ${LH_HIDAPI_TARGET} Threads::Threads ZLIB::ZLIB)
   if(WIN32)
     target_link_libraries(lh_usb PUBLIC advapi32)
@@ -228,7 +228,13 @@ endif()
 option(LH_BUILD_OPENVR_DRIVER "Build the drop-in driver_lighthouse.so" ON)
 find_path(OPENVR_INCLUDE_DIR openvr_driver.h PATH_SUFFIXES openvr)
 if(LH_BUILD_OPENVR_DRIVER AND LH_BUILD_USB AND OPENVR_INCLUDE_DIR)
-  add_library(driver_lighthouse MODULE src/openvr/driver_lighthouse.cpp src/openvr/hand_skeleton.cpp src/openvr/raw_alignment.cpp src/openvr/steam_rooms.cpp src/openvr/room_publisher.cpp src/openvr/host_frame.cpp src/openvr/stock_hmd.cpp src/openvr/pairing_mailbox.cpp src/openvr/telemetry_server.cpp src/openvr/watchdog.cpp $<TARGET_OBJECTS:lh_runtime>)
+  # The driver's code, compiled once: the SteamVR driver below and lhsession (the same driver run
+  # without SteamVR) are both built from it.
+  add_library(lh_driver_objs OBJECT src/openvr/driver_lighthouse.cpp src/openvr/hand_skeleton.cpp src/openvr/raw_alignment.cpp src/openvr/steam_rooms.cpp src/openvr/room_publisher.cpp src/openvr/host_frame.cpp src/openvr/stock_hmd.cpp src/openvr/pairing_mailbox.cpp src/openvr/telemetry_server.cpp src/openvr/watchdog.cpp)
+  set_target_properties(lh_driver_objs PROPERTIES CXX_VISIBILITY_PRESET hidden POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(lh_driver_objs PRIVATE include src ${OPENVR_INCLUDE_DIR})
+  target_link_libraries(lh_driver_objs PRIVATE lh_report lh_tracking lh_usb Ceres::ceres Eigen3::Eigen nlohmann_json::nlohmann_json)
+  add_library(driver_lighthouse MODULE $<TARGET_OBJECTS:lh_driver_objs> $<TARGET_OBJECTS:lh_runtime>)
   if(WIN32)
     target_link_libraries(driver_lighthouse PRIVATE setupapi hid)  # stock_hmd: hiding devices from the stock DLL
     # HmdDriverFactory and our hidapi, for drivers that hook HID access (the .def says why).
@@ -257,6 +263,17 @@ if(LH_BUILD_OPENVR_DRIVER AND LH_BUILD_USB AND OPENVR_INCLUDE_DIR)
   if(NOT WIN32 AND NOT APPLE)
     target_link_options(driver_lighthouse PRIVATE
       -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/openvr/exports.map -Wl,--no-undefined)
+  endif()
+  # lhsession: the driver without SteamVR (apps/lhsession/main.cpp), built in.
+  find_package(Threads REQUIRED)
+  add_executable(lhsession apps/lhsession/main.cpp $<TARGET_OBJECTS:lh_driver_objs> $<TARGET_OBJECTS:lh_runtime>)
+  target_include_directories(lhsession PRIVATE ${OPENVR_INCLUDE_DIR})
+  target_link_libraries(lhsession PRIVATE lh_report lh_tracking lh_usb Ceres::ceres Eigen3::Eigen nlohmann_json::nlohmann_json
+                        ${CMAKE_DL_LIBS} Threads::Threads)
+  if(WIN32)
+    target_link_libraries(lhsession PRIVATE setupapi hid)
+  else()
+    target_link_options(lhsession PRIVATE -static-libstdc++ -static-libgcc)
   endif()
 else()
   message(STATUS "OpenVR driver headers not found: skipping driver_lighthouse.so")
@@ -421,6 +438,7 @@ if(LH_BUILD_TESTS)
     tests/unit/test_pose_solver.cpp
     tests/unit/test_tracker.cpp
     tests/unit/test_direct_filter.cpp
+    tests/unit/test_disable_imu.cpp
     tests/unit/test_disambiguator_sob.cpp
     tests/unit/test_pulse_sorter.cpp
     tests/unit/test_mixed_light.cpp

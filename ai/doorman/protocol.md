@@ -131,7 +131,7 @@ frames = repeated [len][frame]
 * Once a second the radio sends `D [queue drops u16][reply drops u16]` (totals). The dongle
   keeps them per slot (cmd 0x28 bytes 12-19) and doesn't pass them on.
 
-### Several dongles (firmware 0x002B)
+### Several dongles (this fork's firmware)
 * Addresses never clash (per-dongle network base), but every dongle sweeps the same 16 hop channels
   in the same order, each at its own period. Two dongles are on one channel whenever the sweeps
   cross: about 1/16 of the time with different periods; with the same number of devices the periods
@@ -154,13 +154,20 @@ frames = repeated [len][frame]
 
 ## Dongle USB interface (VID:PID 6767:0727, "Doorman Dongle")
 
-**Four HID interfaces** (firmware 0x000D), 64-byte reports, 1 ms interval (endpoints
-0x01/0x81 .. 0x04/0x84). **Slot s streams on interface s % 4**; interface 0 also carries every
-command and reply (replies go first). One interrupt IN endpoint sends at most one 64-byte report
+**Five HID interfaces** (firmware 0x002B; four, endpoints 0x01/0x81 .. 0x04/0x84, from 0x000D),
+64-byte reports, 1 ms interval. Interface 0 has IN 0x81 and OUT 0x01; interfaces 1-4 only send
+(IN 0x82 .. 0x85): the host writes on interface 0 only, and six endpoints instead of ten leave room in
+a USB 2.0 hub's periodic budget (eight on a hub chip shared with other full-speed devices failed with
+Code 10). **Slot s streams on interface s % 5** (s % 4 on four-interface firmware); interface 0 also
+carries every command and reply (replies go first). Hosts take the count from the USB bcdDevice
+(the firmware version): five from 0x002B. An interface tops out at 59.7 kB/s of stream (measured
+with the dongle's test load); a Tracker 3.0 on 2.0 base stations streams ~18 kB/s, so ten devices on
+four interfaces put three on two of them, ~90 % full: those slots dropped 6-48 frames/s and their IMU
+queued 28-43 ms (median). Five keep every interface at two. One interrupt IN endpoint sends at most one 64-byte report
 per 1 ms frame (~61 kB/s). With two interfaces the even slots' endpoint ran near that limit with
 five devices, and their data waited in the dongle: a controller in slot 2 arrived 12-27 ms older
 at the median (p90 31-61 ms) than one in slot 1. With four, at most two devices share an
-endpoint (both controllers then 5-6 ms median, p90 ~11.5 ms). Hosts open all four (grouped by USB
+endpoint (both controllers then 5-6 ms median, p90 ~11.5 ms). Hosts open all of them (grouped by USB
 serial) and read them all: the driver (`DoormanDongle::devs_`), the dongle manager, the installer
 and `doorman_link.py`. Older two-interface firmware isn't supported.
 
@@ -204,7 +211,8 @@ and `doorman_link.py`. Older two-interface firmware isn't supported.
 | 0x33 | rejoin `[slot]`: the slot is not polled (for 1.5 s at most), so its radio rejoins (status 2: not paired). The host sends it when a connected device has sent nothing for 6 s |
 | 0x34 | set a slot's name `[slot][len][UTF-8, up to 59 B]`, len 0 clears (status 2: not paired or too long). Kept in flash with the pairings; forgetting or re-pairing the slot clears it |
 | 0x35 | a slot's name `[slot]` -> `[len][UTF-8]` |
-| 0x36 | hop channel set `[op][mask lo][mask hi]` (firmware 0x002B): op 0xFF query, 0 back to the saved set, 1 this set until a restart, 2 this set and saved (flash, with the pairings). At least 4 channels (status 2). Reply: set now, saved set, mask in use (u16 each). See "Several dongles" |
+| 0x36 | hop channel set `[op][mask lo][mask hi]` (this fork's firmware; status 1 on upstream's): op 0xFF query, 0 back to the saved set, 1 this set until a restart, 2 this set and saved (flash, with the pairings). At least 4 channels (status 2). Reply: set now, saved set, mask in use (u16 each). See "Several dongles" |
+| 0x38 | radio versions (fw 0x002C+) -> `[n][u32 LE per slot]`: each paired device's radio as it last answered `0xF0 'X'`, kept in flash (0 unknown) |
 | 0x29 | live `[first]` (6 slots per reply, as 0x25): per slot `[used\|active<<1][rssi last rx][rssi last tx][min][max][channel][ms since reply u32]`. Min/max reset on read |
 | 0x2A | identity: the slot's last `H` frame (16 B, zeros if none) |
 

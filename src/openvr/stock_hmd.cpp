@@ -4,6 +4,7 @@
 #include "pairing_mailbox.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cwchar>
@@ -423,11 +424,19 @@ class StockHmd::DeviceProxy : public ITrackedDeviceServerDriver {
   void Deactivate() override {
     alive_ = false;  // ours stops publishing its pose first
     published_.SetActive(false);  // and its last pose isn't this device's any more
-    inner_->Deactivate();
+    Timed("Deactivate", [&] { inner_->Deactivate(); });
+  }
+  // SteamVR's thread aborts SteamVR when a call is stuck ~11 s while quitting: slow ones are logged.
+  template <class F>
+  void Timed(const char* what, F&& call) {
+    const auto t0 = std::chrono::steady_clock::now();
+    call();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (ms > 100 && owner_->log_) owner_->log_(std::string("slow stock driver headset ") + what + ": " + std::to_string(int(ms)) + " ms");
   }
   // StockHmd::Cleanup, before the stock provider's: GetPose no longer touches the stock device.
   void Close() { published_.Close(); }
-  void EnterStandby() override { inner_->EnterStandby(); }
+  void EnterStandby() override { Timed("EnterStandby", [&] { inner_->EnterStandby(); }); }
   void* GetComponent(const char* name) override { return inner_->GetComponent(name); }
   void DebugRequest(const char* request, char* response, uint32_t size) override {
     if (owner_->requestHandler_ && owner_->requestHandler_(request, response, size)) return;

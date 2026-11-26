@@ -22,6 +22,7 @@
 #include <array>
 #include <chrono>
 #include <string>
+#include <optional>
 #include <thread>
 #include "common/crash_log.hpp"
 #include "driver_check.hpp"
@@ -233,13 +234,14 @@ int RunOverlay() {
   ui.SetLogo(UploadRgba(kLogoRgba, kLogoSize, kLogoSize));
 
   auto last = std::chrono::steady_clock::now();
-  bool running = true, notified = false;
+  bool running = true;
+  int notified = 0;   // the last notice shown in the headset (its generation)
   while (running) {
     // In the headset too: the desktop dialog isn't seen with it on.
     // SteamVR's own notification in the headset: a replaced driver stays until dismissed, a new
     // release is a passing one.
-    if (!notified && !openhouse::overlay::NoticeText().empty()) {
-      notified = true;
+    if (!openhouse::overlay::NoticeText().empty() && openhouse::overlay::Notice().generation != notified) {
+      notified = openhouse::overlay::Notice().generation;
       if (vr::IVRNotifications* n = vr::VRNotifications()) {
         const bool replaced = openhouse::overlay::Notice().kind == openhouse::overlay::NoticeKind::Replaced;
         const std::string text = openhouse::overlay::NoticeText() + (replaced ? ". Open openhouse in the dashboard to reinstall" : "");
@@ -259,13 +261,21 @@ int RunOverlay() {
         vr::VRSystem()->AcknowledgeQuit_Exiting();
         running = false;
       }
+    // A frame's pointer moves and scrolls go to ImGui as one position and one scroll: ImGui takes one
+    // change of input kind per frame, and the laser's move every frame alternating with a thumb resting
+    // on the trackpad (a scroll every frame) queued faster than it drained, so the cursor fell seconds
+    // behind. Clicks keep their place: the position is handed over before each.
+    std::optional<ImVec2> pointer;
+    float wheelX = 0, wheelY = 0;
+    const auto flushPointer = [&] { if (pointer) io.AddMousePosEvent(pointer->x, pointer->y); pointer.reset(); };
     while (overlay->PollNextOverlayEvent(main, &event, sizeof event)) {
       switch (event.eventType) {
-        case vr::VREvent_MouseMove: io.AddMousePosEvent(event.data.mouse.x, MouseY(event.data.mouse.y)); break;
+        case vr::VREvent_MouseMove: pointer = ImVec2(event.data.mouse.x, MouseY(event.data.mouse.y)); break;
         case vr::VREvent_MouseButtonDown:
         case vr::VREvent_MouseButtonUp: {
           const int button = event.data.mouse.button == vr::VRMouseButton_Right ? 1 : event.data.mouse.button == vr::VRMouseButton_Middle ? 2 : 0;
-          io.AddMousePosEvent(event.data.mouse.x, MouseY(event.data.mouse.y));
+          pointer = ImVec2(event.data.mouse.x, MouseY(event.data.mouse.y));
+          flushPointer();
           io.AddMouseButtonEvent(button, event.eventType == vr::VREvent_MouseButtonDown);
           break;
         }
@@ -280,11 +290,13 @@ int RunOverlay() {
         case vr::VREvent_KeyboardClosed:
           ui.CancelTrackerName(event.data.keyboard.uUserValue);
           break;
-        case vr::VREvent_ScrollSmooth: io.AddMouseWheelEvent(event.data.scroll.xdelta, event.data.scroll.ydelta); break;
-        case vr::VREvent_FocusLeave: io.AddMousePosEvent(-FLT_MAX, -FLT_MAX); break;
+        case vr::VREvent_ScrollSmooth: wheelX += event.data.scroll.xdelta; wheelY += event.data.scroll.ydelta; break;
+        case vr::VREvent_FocusLeave: pointer = ImVec2(-FLT_MAX, -FLT_MAX); break;
         default: break;
       }
     }
+    flushPointer();
+    if (wheelX != 0 || wheelY != 0) io.AddMouseWheelEvent(wheelX, wheelY);
     const auto now = std::chrono::steady_clock::now();
     const double seconds = std::chrono::duration<double>(now.time_since_epoch()).count();
     ui.Poll(seconds);

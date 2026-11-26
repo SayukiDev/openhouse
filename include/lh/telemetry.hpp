@@ -13,10 +13,11 @@
 //                   "learned":N,"seen":N},
 //           "bases":[{"serial","channel","mode","lh2","seen","placed","origin","locked",
 //                     "observations","sigma","learned","status","p":[x,y,z],"q":[w,x,y,z],"faults"}],
-//           "devices":[{"serial","role","model","connected","enabled","battery","charging",
+//           "devices":[{"serial","role","model","connected","enabled","imuDisabled","battery","charging",
 //                       "state","result","valid","p","q","v","primary","bases":[...],
 //                       "coverage":[{"base","frames","sensors"}],"basesSeen":N}],
-//           "receivers":[{"serial","connected"}],
+//           "receivers":[{"serial","connected", Doorman slots: "firmware","firmwareOld" (the dongle's),
+//                         "radio","radioOld" (the device's radio; Old: older than the driver's)}],
 //           "settings":{"positionSmoothingMs","rotationSmoothingMs","predictWithAcceleration",
 //                       "hideLostDevices","mixedLight","mixedLight...","host","steamvr",
 //                       "recording","recordingPath","reportBusy","report":{"count","path","error"},"steamRooms",
@@ -28,6 +29,7 @@
 //   {"type":"command","id":N,"cmd":"resetRoom"}           {"cmd":"saveReport"}
 //   {"type":"command","id":N,"cmd":"identify"|"powerOff","serial":"LHR-..."}
 //   {"type":"command","id":N,"cmd":"enable","serial":"LHR-...","enabled":B}
+//   {"type":"command","id":N,"cmd":"imu","serial":"LHR-...","enabled":B}   (false: optical-only tracking)
 //   {"type":"command","id":N,"cmd":"renameTracker","serial":"LHR-...","name":"..."}
 //       Names are trimmed of spaces and limited to 63 UTF-8 bytes without ASCII control characters.
 //       An empty name clears the alias for a known tracker.

@@ -593,6 +593,7 @@ int main(int argc, char** argv) {
       ImGui::TableHeadersRow();
       for (const auto& r : receivers) {
         const bool ohd = r.kind == "openhouse";
+        ImGui::PushID(r.serial.c_str());   // every row's graph is "##kbps"
         ImGui::TableNextRow(ImGuiTableRowFlags_None, 30);
         ImGui::TableNextColumn();
         Dot(r.linked, ohd && (r.lossPercent >= 10 || r.dropsPerSec > 0));
@@ -636,6 +637,7 @@ int main(int argc, char** argv) {
           ImGui::SameLine(0, 3); ImGui::TextDisabled("/");
           ImGui::SameLine(0, 3); ImGui::TextColored(RssiColor(r.rssiDevice), "%d", r.rssiDevice);
         } else ImGui::TextDisabled("-");
+        ImGui::PopID();
       }
       ImGui::EndTable();
     }

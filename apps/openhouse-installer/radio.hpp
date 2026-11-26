@@ -99,6 +99,7 @@ struct DoormanDongleInfo {
   int board = 0;                 // 0 UF2 (Pro Micro style), 1 Holyiot 21017, 2 PCA10059, 3 Kuroshin (Nordic DFU)
   int bank = 0;                  // the bank it runs from (1 A, 2 B); 0: older firmware without banks
   int slots = 8;                 // the slots it has (it says so from firmware 0x002A; older ones have 8)
+  int oldRadios = -1;            // its connected devices whose radio has an update (-1: not asked)
   bool NordicDfu() const { return board >= 1 && board <= 3; }
   bool Banked() const { return bank != 0; }   // updates itself over USB, no bootloader
 };
@@ -110,6 +111,7 @@ struct DongleSlot {
   int slot = 0;
   bool paired = false, on = false, answered = false;
   WirelessDevice device;
+  uint32_t storedRadio = 0;   // the radio version the dongle remembers for it, off too (fw 0x002C+; 0 unknown)
 };
 std::vector<DongleSlot> ScanDongleSlots(const DoormanDongleInfo& dongle);   // every slot it has
 // Turns a device on a Doorman Dongle off (its main MCU's power-off command, as the driver sends it).

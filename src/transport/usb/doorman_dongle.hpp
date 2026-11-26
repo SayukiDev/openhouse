@@ -47,12 +47,16 @@ class ReportDecoder;
 extern bool g_doormanInlineIo;
 
 // The dongle's USB data interfaces: interface 0 carries commands and replies, slot s streams on
-// interface s % kDoormanInterfaces (dongle-fw usb_descriptors.c).
-constexpr int kDoormanInterfaces = 4;
+// interface s % (its count) (dongle-fw usb_descriptors.c): five from firmware 0x002B, four before.
+constexpr int kDoormanInterfaces = 5;   // the most a dongle has
+int DoormanInterfaceCount(unsigned short firmware);   // from the USB bcdDevice
+// Older than the firmware this driver was built with (doorman/common/doorman_versions.h).
+bool DongleOutdated(int firmware);
+bool RadioOutdated(uint32_t radio);
 // One Doorman Dongle as hidapi lists it: its interfaces, all with the same USB serial.
 struct DoormanDongleFound {
   std::string serial;  // "OHDG-" + USB serial: the dongle's receiver name
-  std::array<std::string, kDoormanInterfaces> paths;   // by interface number; paths[0] takes commands
+  std::array<std::string, kDoormanInterfaces> paths;   // by interface number; paths[0] takes commands ("" past its count)
 };
 // The Doorman Dongles in an enumeration, by serial: a dongle once every interface of its USB
 // serial is listed, wherever each is in the list. A serial carried by more than one interface
@@ -120,7 +124,7 @@ class DoormanDongle {
   // The user's name for a slot's device, kept on the dongle (firmware 0x0025+, cmd 0x34). Any
   // thread; false if the dongle isn't open.
   bool SetName(int slot, const std::string& name);
-  // The hop channels it keeps to (DoormanHopChannels; firmware 0x002B+, cmd 0x36; older firmware
+  // The hop channels it keeps to (DoormanHopChannels; this fork's firmware, cmd 0x36; other firmware
   // ignores it). 0: its saved set. Sent by Pump when it changes, when the dongle is opened, and
   // every 5 s (a dongle that restarted, or a tool that set another). Reader thread.
   void SetHopChannels(uint16_t mask) { hopWant_ = mask; }
@@ -134,6 +138,9 @@ class DoormanDongle {
     double kBytesPerSec = 0, framesPerSec = 0, lossPercent = -1, dropsPerSec = 0;
     int rssiDongle = 0, rssiDevice = 0, devicesOnDongle = 0;
     std::string name; bool haveName = false;   // the name kept on the dongle (haveName: it keeps names)
+    int dongleFirmware = 0;                    // the dongle's firmware, 0 until it says
+    uint32_t radio = 0;                        // the device's radio firmware (remembered by the dongle when off), 0 unknown
+    bool dongleOld = false, radioOld = false;  // older than the firmware this driver came with
   };
   std::vector<SlotStat> SlotStats() const;
 
@@ -171,6 +178,8 @@ class DoormanDongle {
     // status) and then made to rejoin, so the cause shows in the log.
     double lastDataT = 0, hostBusyT = -1e9; bool streamed = false;
     std::string name; bool haveName = false; int nameSeq = -1;   // its name on the dongle (0x35)
+    uint32_t radio = 0; double radioAskT = -1e9; int radioTries = 0;   // its radio's firmware ('X' status)
+    uint32_t storedRadio = 0;   // what the dongle remembers for the slot (cmd 0x38, fw 0x002C+), the device off too
     // IMU sample timestamps out of step (the air codec garbling them): count in a row, and the last.
     uint32_t lastImuTicks = 0; bool haveImuTicks = false; int garbledImu = 0; double garbledRejoinT = -1e9;
     int silentStage = 0; std::array<uint32_t, 15> silentRaw{};
@@ -239,6 +248,7 @@ class DoormanDongle {
   Slot slots_[kSlots];
   std::vector<uint8_t> frag_[kSlots];   // a frame split over several stream reports, per slot
   int packSeq_[kSlots]{};
+  int firmware_ = 0;                    // the dongle's firmware version (info), 0 until it says
   int slotCount_ = 8;                   // the slots this dongle has (info byte 60, firmware 0x002A+); 8 until it says                 // packed reports (0x82): the next seq expected, -1 = not in step
 
   mutable std::mutex mutex_;          // featureWaits_, downlinks_, pairMs_, opened_, slot serials

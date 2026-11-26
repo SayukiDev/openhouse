@@ -114,6 +114,8 @@ class UsbTransport {
     double kBytesPerSec = 0, framesPerSec = 0, lossPercent = -1, dropsPerSec = 0;
     int rssiDongle = 0, rssiDevice = 0, devicesOnDongle = 0;
     std::string name; bool keepsName = false;   // openhouse: the name on the dongle, and whether it keeps one
+    int firmware = 0; uint32_t radio = 0;        // openhouse: dongle and device radio firmware (0 unknown)
+    bool firmwareOld = false, radioOld = false;  // older than this driver's
   };
   std::vector<Receiver> Receivers() const;
   // The name a Doorman Dongle keeps for one of its slots ("OHDG-.../3"); false if there's no such slot.

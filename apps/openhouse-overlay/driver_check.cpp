@@ -1,10 +1,15 @@
 #include "platform/platform.hpp"
 #include "driver_check.hpp"
+#include "telemetry_client.hpp"
 
 #include <lh/github.hpp>
+#include <lh/telemetry.hpp>
 #include <lh/version.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <optional>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -13,6 +18,8 @@
 #include <fstream>
 #include <iterator>
 #include <mutex>
+#include <set>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -156,15 +163,26 @@ void OpenUrl(const std::string& url) {
 #endif
 }
 
+#ifndef _WIN32
+// Linux: no Update button for old firmware; where to do it instead.
+constexpr const char* kFirmwareHowTo = "Please run the installer and update your Doorman devices through the \"Update Dongles\" menu!";
+#endif
 bool g_underSteamVR = false;  // the overlay under SteamVR (else --check: Monado / WiVRn)
 
 std::string DialogText(const NoticeState& n) {
   if (n.kind == NoticeKind::Replaced) return "A SteamVR update replaced the openhouse driver.";
+#ifdef _WIN32
+  if (n.kind == NoticeKind::Firmware) return "These need a firmware update:\n" + n.tag;
+#else
+  if (n.kind == NoticeKind::Firmware) return "These need a firmware update:\n" + n.tag + "\n\n" + kFirmwareHowTo;
+#endif
   return "openhouse " + n.tag + " is available (you have v" + std::string(lh::kVersion) + ").";
 }
 std::string ConfirmText(const NoticeState& n, NoticeAction a) {
   const std::string question = a == NoticeAction::Uninstall ? "Uninstall openhouse?"
-                               : n.kind == NoticeKind::Replaced ? "Fix openhouse?" : "Update openhouse to " + n.tag + "?";
+                               : n.kind == NoticeKind::Replaced ? "Fix openhouse?"
+                               : n.kind == NoticeKind::Firmware ? "Update the firmware?"
+                                                                : "Update openhouse to " + n.tag + "?";
   return question + "\n\nVR will shut down. These will be closed:\n" + ClosingText(g_underSteamVR) +
          (a == NoticeAction::Uninstall ? "\n\nYour room and settings are kept." : "");
 }
@@ -295,7 +313,17 @@ int Ask(const std::string& text, const std::string& first, const std::string& se
   Log("no dialog tool: notification only");
   return 2;
 }
+// Information only, OK: zenity, else kdialog, else a notification.
+void Tell(const std::string& text) {
+  const std::string t = Quoted(kTitle), m = Quoted(text), env = DesktopEnv();
+  if (Have("zenity") && std::system((env + "zenity --info --width=440 --title=" + t + " --text=" + m + " >/dev/null 2>&1").c_str()) == 0) return;
+  if (Have("kdialog") && std::system((env + "kdialog --title " + t + " --msgbox " + m + " >/dev/null 2>&1").c_str()) == 0) return;
+  if (!Have("notify-send") || std::system((env + "notify-send -u critical " + t + " " + m + " >/dev/null 2>&1").c_str()) != 0)
+    std::fprintf(stderr, "%s: %s\n", kTitle, text.c_str());
+  Log("no dialog tool: notification only");
+}
 NoticeAction AskUser(const NoticeState& n) {
+  if (n.kind == NoticeKind::Firmware) { Tell(DialogText(n)); return NoticeAction::Ignore; }   // no Update here
   if (n.kind != NoticeKind::Replaced) return Ask(DialogText(n), "Update", "", "Ignore") == 0 ? NoticeAction::Update : NoticeAction::Ignore;
   const int r = Ask(DialogText(n), "Fix", "Uninstall openhouse", "Ignore");
   return r == 0 ? NoticeAction::Update : r == 1 ? NoticeAction::Uninstall : NoticeAction::Ignore;
@@ -335,7 +363,10 @@ std::string NewerRelease() {
 
 void Set(NoticeKind kind, const std::string& tag) {
   std::lock_guard lock(g_mutex);
-  if (g_notice.kind != NoticeKind::None) return;  // the first one found stays
+  if (g_notice.kind != NoticeKind::None && !g_notice.handled) return;  // the one up stays until it's dealt with
+  const int generation = g_notice.generation + 1;
+  g_notice = NoticeState{};
+  g_notice.generation = generation;
   g_notice.kind = kind;
   g_notice.tag = tag;
 }
@@ -350,6 +381,11 @@ std::string NoticeText() {
   const NoticeState n = Notice();
   if (n.kind == NoticeKind::None || n.handled) return {};
   if (n.kind == NoticeKind::Replaced) return "A SteamVR update replaced the openhouse driver";
+#ifdef _WIN32
+  if (n.kind == NoticeKind::Firmware) return "Dongle or device firmware needs an update";
+#else
+  if (n.kind == NoticeKind::Firmware) return std::string("Dongle or device firmware needs an update. ") + kFirmwareHowTo;
+#endif
   return "openhouse " + n.tag + " is available";
 }
 
@@ -361,12 +397,13 @@ void ActOnNotice(NoticeAction action) {
       if (g_notice.updating) return;  // the overlay and the dialog both pressed
       g_notice.updating = true;
     }
-    const bool replaced = n.kind == NoticeKind::Replaced;
+    const bool replaced = n.kind == NoticeKind::Replaced, firmware = n.kind == NoticeKind::Firmware;
     // The changelog, while the installer does the rest.
-    if (action == NoticeAction::Update && !replaced)
+    if (action == NoticeAction::Update && !replaced && !firmware)
       OpenUrl(n.tag.empty() ? std::string(kReleases) : "https://github.com/YusufOzmen01/openhouse/releases/tag/" + n.tag);
     std::string error;
-    const bool ok = StartInstaller(action == NoticeAction::Uninstall ? "--uninstall" : replaced ? "--repair" : "--update", &error);
+    const bool ok = StartInstaller(action == NoticeAction::Uninstall ? "--uninstall" : replaced ? "--repair" : firmware ? "--dongles" : "--update",
+                                  &error);
     std::lock_guard lock(g_mutex);
     g_notice.updating = ok;
     g_notice.handled = ok;
@@ -393,6 +430,85 @@ void OfferUpdate(const std::string& tag) {
   Set(NoticeKind::Newer, tag);
 }
 
+void RunFirmwareCheck(bool underSteamVR) {
+  g_underSteamVR = underSteamVR;
+  viewer::TelemetryClient client(lh::telemetry::PortFromEnvironment());
+  using Clock = std::chrono::steady_clock;
+  const auto start = Clock::now();
+  bool everConnected = false;
+  // Each Doorman Dongle that turns up (there at the start, plugged in or replugged later) is checked
+  // once: its firmware, and the radios of the devices that join it within kWindow.
+  struct Watch { Clock::time_point since; std::optional<Clock::time_point> settled; };
+  std::map<std::string, Watch> watching;
+  std::set<std::string> present;
+  constexpr auto kWindow = std::chrono::seconds(60);
+  for (;;) {
+    const auto now = Clock::now();
+    client.Poll(std::chrono::duration<double>(now.time_since_epoch()).count());
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    if (client.Connected()) everConnected = true;
+    // Monado / WiVRn (--check): done once the driver has gone; nothing to watch if it never came.
+    if (!underSteamVR && ((everConnected && !client.Connected()) || (!everConnected && now - start > std::chrono::minutes(10)))) return;
+    if (!client.HaveState() || !client.FreshState(std::chrono::duration<double>(now.time_since_epoch()).count())) {
+      if (!client.Connected()) present.clear();   // a driver that comes back lists its dongles anew
+      continue;
+    }
+    const auto& receivers = client.Current().receivers;
+    std::set<std::string> nowPresent;
+    for (const auto& r : receivers)
+      if (r.slot >= 0) nowPresent.insert(r.serial.substr(0, r.serial.rfind('/')));
+    for (const auto& d : nowPresent)
+      if (!present.count(d)) { watching[d] = Watch{now, {}}; Log("firmware check: watching " + d); }
+    present = nowPresent;
+    std::string list;
+    for (auto it = watching.begin(); it != watching.end();) {
+      const std::string& dongle = it->first;
+      Watch& w = it->second;
+      if (!present.count(dongle)) { it = watching.erase(it); continue; }   // unplugged again
+      std::string found;
+      bool pending = false, unknownOff = false;
+      for (const auto& r : receivers) {
+        if (r.slot < 0 || r.serial.rfind(dongle + "/", 0) != 0) continue;
+        if (!r.firmware) pending = true;
+        if (r.linked && !r.radio) pending = true;
+        if (r.paired && !r.linked && !r.radio) unknownOff = true;   // off, and the dongle doesn't remember it
+        if (r.paired && r.radio && r.radioOld) {
+          char v[16];
+          std::snprintf(v, sizeof v, "%08X", r.radio);
+          found += "- " + (r.connected.empty() ? "Slot " + std::to_string(r.slot + 1) + " of " + dongle : r.connected) + " (radio " + v +
+                   (r.linked ? ")\n" : ", off)\n");
+        }
+        if (r.firmwareOld && found.find("Doorman Dongle " + dongle) == std::string::npos) {
+          char v[16];
+          std::snprintf(v, sizeof v, "%04X", r.firmware);
+          found.insert(0, "- Doorman Dongle " + dongle + " (firmware " + v + ")\n");
+        }
+      }
+      if (pending) w.settled.reset();
+      else if (!w.settled) w.settled = now;
+      const bool settled = w.settled && now - *w.settled >= std::chrono::seconds(5);
+      // Old firmware once its answers are in; up to date once its window is over.
+      if (settled && !found.empty()) {
+        // Devices that are off and whose radio isn't known (dongles before 0x002C don't keep it).
+        if (unknownOff) found += "- Turn on all the devices on " + dongle + " so they're updated too\n";
+        list += found;
+        it = watching.erase(it);
+        continue;
+      }
+      if (now - w.since > kWindow && !pending) { it = watching.erase(it); continue; }
+      ++it;
+    }
+    if (list.empty()) continue;
+    if (!list.empty() && list.back() == '\n') list.pop_back();
+    Log("firmware check: old firmware:\n" + list);
+    // A notice still waiting for an answer goes first (the overlay's card, the dialog).
+    while (Notice().kind != NoticeKind::None && !Notice().handled) std::this_thread::sleep_for(std::chrono::seconds(1));
+    Set(NoticeKind::Firmware, list);
+    Dialog();
+    if (Notice().updating) return;   // the installer takes over (and closes VR)
+  }
+}
+
 std::string JoinedPath(int argc, char** argv, int first) {
   // SteamVR hands over a manifest's "arguments" with their quotes, and may split a path with
   // spaces: the pieces are joined and the quotes dropped.
@@ -415,9 +531,10 @@ int RunDriverCheck(const std::string& folder, bool underSteamVR) {
   if (bytes.find(kMarker) != std::string::npos) {
     Log("driver is openhouse's: fine");
     const std::string tag = NewerRelease();
-    if (tag.empty()) return 0;
+    if (tag.empty()) { RunFirmwareCheck(underSteamVR); return 0; }
     Set(NoticeKind::Newer, tag);
     Dialog();
+    if (!Notice().updating) RunFirmwareCheck(underSteamVR);   // compared with the installed openhouse, not GitHub
     return 0;
   }
   Log("driver was replaced: telling the user");

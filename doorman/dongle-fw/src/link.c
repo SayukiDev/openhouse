@@ -26,13 +26,18 @@ static uint32_t us_now(void) { NRF_TIMER1->TASKS_CAPTURE[0] = 1; return NRF_TIME
    reads as no names. UTF-8, NUL-padded; at most DML_NAME_MAX bytes (what one command carries). */
 #define NAME_MAGIC  0x4D4E484Fu        /* "OHNM" */
 #define DML_NAME_MAX 59
+/* Radio versions (cmd 0x38): each paired device's radio firmware as it last said ('X' answers seen on
+   their way to the host), so a host can tell a device needs an update while it's off. An older page
+   ends before them (erased: radios_magic 0xFFFFFFFF) and reads as none known. */
+#define RADIO_MAGIC 0x5652484Fu        /* "OHRV" */
 /* Hop channels this dongle keeps to (cmd 0x36), bit k = dml_hop_ch[k]: dongles side by side get
-   sets with no channel in common, so they never meet on one. A page from older firmware ends before
-   it (erased: hop_magic is 0xFFFFFFFF), and reads as all 16. */
+   sets with no channel in common, so they never meet on one. After the radio versions (upstream's
+   page layout stays as it is): a page without it (erased: hop_magic is 0xFFFFFFFF) reads as all 16. */
 #define HOP_MAGIC   0x4348484Fu        /* "OHHC" */
 #define HOP_MIN     4                  /* the fewest hop channels a dongle can be kept to */
 typedef struct { uint32_t magic, used; uint8_t id[DML_SLOTS][8]; uint32_t names_magic; char name[DML_SLOTS][64];
-                 uint32_t hop_magic, hop_allow; } pair_store_t;
+                 uint32_t radios_magic; uint32_t radio[DML_SLOTS]; uint32_t hop_magic, hop_allow; } pair_store_t;
+static int pairs_dirty;                /* a radio version changed: saved from link_poll, not mid-frame */
 static pair_store_t pairs;
 static int mask_bits(uint32_t m) { int n = 0; for (; m; m &= m - 1) n++; return n; }
 static int hop_allow_ok(uint32_t m) { return m <= 0xFFFFu && mask_bits(m) >= HOP_MIN; }
@@ -48,6 +53,7 @@ static void pairs_load(void)
     pairs.magic = PAIR_MAGIC; pairs.used = old->used & 0xFF;
     memcpy(pairs.id, old->id, sizeof old->id);
     pairs.names_magic = NAME_MAGIC;
+    pairs.radios_magic = RADIO_MAGIC;
     if (old->names_magic == NAME_MAGIC) memcpy(pairs.name, old->name, sizeof old->name);
     pairs.hop_magic = HOP_MAGIC; pairs.hop_allow = 0xFFFF;
     pairs_save();
@@ -56,6 +62,7 @@ static void pairs_load(void)
   memcpy(&pairs, (const void *)PAIR_PAGE, sizeof pairs);
   if (pairs.magic != PAIR_MAGIC) { memset(&pairs, 0, sizeof pairs); pairs.magic = PAIR_MAGIC; }
   if (pairs.names_magic != NAME_MAGIC) { memset(pairs.name, 0, sizeof pairs.name); pairs.names_magic = NAME_MAGIC; }
+  if (pairs.radios_magic != RADIO_MAGIC) { memset(pairs.radio, 0, sizeof pairs.radio); pairs.radios_magic = RADIO_MAGIC; }
   if (pairs.hop_magic != HOP_MAGIC || !hop_allow_ok(pairs.hop_allow)) { pairs.hop_magic = HOP_MAGIC; pairs.hop_allow = 0xFFFF; }
 }
 static void pairs_save(void)
@@ -210,6 +217,11 @@ static uint32_t dec_sum, dec_n, dec_max;
 static void deliver(slot_t *s, const uint8_t *f, int gl)
 {
   if (f[0] == 'H' && gl <= 16) { memset(s->ident, 0, 16); memcpy(s->ident, f, gl); }
+  if (f[0] == 0xF0 && f[1] == 'X' && gl >= 6) {            /* its radio's version: kept for when it's off */
+    const int k = (int)(s - sl);
+    const uint32_t v = (uint32_t)f[2] | (uint32_t)f[3] << 8 | (uint32_t)f[4] << 16 | (uint32_t)f[5] << 24;
+    if (k >= 0 && k < DML_SLOTS && ((pairs.used >> k) & 1) && v && pairs.radio[k] != v) { pairs.radio[k] = v; pairs_dirty = 1; }
+  }
   if (f[0] == 'D' && gl >= 5) { s->dev_drops = (uint16_t)(f[1] | f[2] << 8); s->dev_reply_drops = (uint16_t)(f[3] | f[4] << 8); }
   else { s->frames_up++; s->bytes_up += (uint32_t)gl; upq_push(s, f, gl); }
 }
@@ -545,6 +557,7 @@ static void join_beacon(void)
       slot = to;
       memcpy(pairs.id[slot], id, 8); pairs.used |= 1u << slot;
       memset(pairs.name[slot], 0, sizeof pairs.name[slot]);   /* another device: not its name */
+      pairs.radio[slot] = 0;                                    /* nor its radio */
       pairs_save();
     }
     pairing_until_ms = 0;
@@ -662,6 +675,7 @@ void link_init(void)
 void link_poll(void)
 {
   load_tick();
+  if (pairs_dirty) { pairs_dirty = 0; pairs_save(); }
   if (!link_on) { radio_off(); return; }
   /* TDMA plan, rebuilt each cycle from the connected slots: the k-th polled at t_c + k*slot_us, then the
      join window. Radios don't need their place in it: they listen for their own address and take the
@@ -905,8 +919,10 @@ int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32.
     return 1;
   }
   case 0x26:                                                /* forget slot (0xFF = all) */
-    if (in[2] == 0xFF) { pairs.used = 0; memset(pairs.name, 0, sizeof pairs.name); }
-    else if (in[2] < DML_SLOTS) { pairs.used &= ~(1u << in[2]); memset(pairs.name[in[2]], 0, sizeof pairs.name[in[2]]); }
+    if (in[2] == 0xFF) { pairs.used = 0; memset(pairs.name, 0, sizeof pairs.name); memset(pairs.radio, 0, sizeof pairs.radio); }
+    else if (in[2] < DML_SLOTS) {
+      pairs.used &= ~(1u << in[2]); memset(pairs.name[in[2]], 0, sizeof pairs.name[in[2]]); pairs.radio[in[2]] = 0;
+    }
     pairs_save();
     return 1;
   case 0x34: {                                              /* set a slot's name: [slot][len][UTF-8] (len 0 clears) */
@@ -917,6 +933,10 @@ int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32.
     if (memcmp(name, pairs.name[in[2]], sizeof name)) { memcpy(pairs.name[in[2]], name, sizeof name); pairs_save(); }
     d[0] = in[2]; return 1;
   }
+  case 0x38:                                                /* radio versions: -> [n][u32 LE per slot] (0 unknown) */
+    d[0] = DML_SLOTS;
+    for (int k = 0; k < DML_SLOTS; k++) put32(d + 1 + 4 * k, ((pairs.used >> k) & 1) ? pairs.radio[k] : 0);
+    return 1;
   case 0x35: {                                              /* a slot's name: [slot] -> [len][UTF-8] */
     if (in[2] >= DML_SLOTS) { *st = 2; return 1; }
     const char *name = pairs.name[in[2]];

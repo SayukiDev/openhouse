@@ -116,6 +116,7 @@ struct DeviceInfo {
   std::string resourceRoot, inputProfile, registeredType;  // config resource_root, input_profile, registered_device_type
   bool connected = false;
   bool enabled = true;          // disabled devices are listed but ignored entirely
+  bool imuDisabled = false;     // optical-only tracking (settings.json disableImuDevices)
   std::optional<int> batteryPercent;
   bool charging = false;
   std::string configJson;       // full device JSON (empty for bases)
@@ -234,6 +235,9 @@ struct SessionOptions {
   // Devices to ignore (serials, e.g. "LHR-0704E07A"). Merged with the persisted
   // settings ($XDG_CONFIG_HOME/lh/settings.json) for live sessions.
   std::vector<std::string> disabledDevices;
+  // Devices whose IMU is ignored (optical-only mode, serials, e.g. "LHR-61420433").
+  // Merged with the persisted settings ($XDG_CONFIG_HOME/lh/settings.json) for live sessions.
+  std::vector<std::string> disableImuDevices;
   // Settings file; empty = default for live sessions, none for replays.
   std::string settingsPath;
   // Device JSON configs (*.json, e.g. from `lhtool configs`) of devices to create at start,
@@ -270,6 +274,8 @@ class Session {
   // Enable/disable a device by serial. Disabled devices produce no poses, input or
   // room-map contributions. Persisted in the settings file when there is one.
   virtual void SetDeviceEnabled(const std::string& serial, bool enabled) = 0;
+  // Optical-only tracking for a device with a broken IMU; saved in settings.json (disableImuDevices).
+  virtual void SetDeviceImuDisabled(const std::string& serial, bool disabled) = 0;
   // Output tuning, for every device, applied at once: how long corrections take to show
   // (glide time constants, s; 0 = at once) and whether poses carry the acceleration for
   // the host to predict with. Defaults 0.06 s, 0.06 s, true.
@@ -301,6 +307,9 @@ class Session {
     int devicesOnDongle = 0;     // openhouse: devices joined on the whole dongle
     std::string name;            // openhouse: the user's name for the slot's device, kept on the dongle
     bool keepsName = false;      // openhouse: the dongle keeps names (firmware 0x0025+)
+    int firmware = 0;            // openhouse: the dongle's firmware, 0 unknown
+    uint32_t radio = 0;          // openhouse: the slot's device radio firmware, 0 unknown
+    bool firmwareOld = false, radioOld = false;   // older than what this driver came with
   };
   virtual std::vector<Receiver> Receivers() const = 0;
   // Stores a name on an openhouse slot ("OHDG-.../3"); false if there's no such slot.

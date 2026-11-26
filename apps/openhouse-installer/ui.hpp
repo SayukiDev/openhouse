@@ -112,6 +112,7 @@ class Ui {
   // --install: installs right away (closing SteamVR), then offers a dongle update if one is due.
   void StartAutoInstall();
   void StartAutoUninstall();  // --uninstall: the same, uninstalling
+  void StartDongleUpdate();   // --dongles: the dongle update page, closing SteamVR / Monado when it needs to
   bool QuitRequested() const { return quit_; }
 
  private:

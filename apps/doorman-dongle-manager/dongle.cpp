@@ -113,7 +113,7 @@ bool Dongle::Open() {
   devs_[0] = hid_open_path(path_.c_str());
   if (!devs_[0]) return false;
   hid_set_nonblocking(H(devs_[0]), 1);
-  // the other interfaces (slot s streams on interface s % 4): the siblings with the same serial
+  // the other interfaces (slot s streams on interface s % 5, s % 4 before fw 0x002B): the siblings with the same serial
   if (hid_device_info* list = hid_enumerate(kVid, kPid)) {
     for (hid_device_info* d = list; d; d = d->next)
       if (d->interface_number > 0 && d->interface_number < kInterfaces && !devs_[d->interface_number] &&

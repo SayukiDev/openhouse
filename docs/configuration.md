@@ -29,6 +29,7 @@ openhouse-overlay's Settings page changes it for you, but you can also edit it b
   "roles": { "LHR-180D3882": "generic_tracker" },
   "controllers": { "left": "LHR-8F9BE6F2", "right": "LHR-13DA81D1" },
   "disabledDevices": ["LHR-0AC3E7C8"],
+  "disableImuDevices": ["LHR-61420433"],
   "positionSmoothingMs": 60,
   "rotationSmoothingMs": 60,
   "predictWithAcceleration": true,
@@ -42,6 +43,7 @@ openhouse-overlay's Settings page changes it for you, but you can also edit it b
 | `roles` | Changes a device's role: `left_hand`, `right_hand` or `generic_tracker`. For example a Vive controller on your hip as a tracker |
 | `controllers` | Which controller is left and which is right |
 | `disabledDevices` | openhouse ignores these devices completely |
+| `disableImuDevices` | Ignores the IMU on these devices and tracks them optically only (useful for devices with a broken or noisy IMU) |
 | `positionSmoothingMs`, `rotationSmoothingMs` | How long a tracking correction takes to show up, 60 ms by default. Lower means less delay, but small corrections can show up as tiny jumps. 0 turns it off |
 | `predictWithAcceleration` | Helps SteamVR predict where your controllers will be during fast motion. On by default |
 | `useSteamVRRooms` | See [below](#use-steamvrs-rooms). On by default |

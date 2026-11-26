@@ -52,6 +52,7 @@ class Ui {
   void StatusBar();
   void UpdateCard();
   void ReplacedBanner();
+  void FirmwareCard();
   void NoticePopups();
   bool confirm_ = false, offered_ = false, uninstall_ = false;  // uninstall_: the confirmation is for uninstalling
   void FloorCalibration();  // the Room map page's "put your controllers down" countdown

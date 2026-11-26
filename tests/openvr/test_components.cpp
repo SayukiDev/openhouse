@@ -708,6 +708,7 @@ struct PairingSession : lh::Session {
   double HostNow() const override { return 0; }
   std::vector<lh::SessionEvent> PollEvents() override { return {}; }
   void SetDeviceEnabled(const std::string&, bool) override {}
+  void SetDeviceImuDisabled(const std::string&, bool) override {}
   void SetOutputTuning(double, double, bool) override {}
   void SetMixedLight(const lh::MixedLightOptions&) override {}
   std::vector<Receiver> Receivers() const override { return receivers; }

@@ -90,6 +90,23 @@ double SteadyNow() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// SteamVR's thread that calls drivers (server_main) has a watchdog: a call stuck ~11 s while it quits
+// aborts SteamVR ("critical error"). Calls into us on that thread that take long are logged by part.
+class SlowCall {
+ public:
+  explicit SlowCall(const char* what, double limit = 0.1) : what_(what), limit_(limit), t0_(SteadyNow()), last_(t0_) {}
+  void Step(const char* part) {
+    const double now = SteadyNow();
+    if (now - last_ > 0.02) parts_ += std::string(parts_.empty() ? "" : ", ") + part + " " + std::to_string(int((now - last_) * 1000)) + " ms";
+    last_ = now;
+  }
+  ~SlowCall();
+ private:
+  const char* what_;
+  double limit_, t0_, last_;
+  std::string parts_;
+};
+
 bool EqualsNoCase(const std::string& a, const char* b) {
   const size_t n = std::strlen(b);
   if (a.size() != n) return false;
@@ -202,6 +219,11 @@ void Log(lh::LogLevel level, const std::string& text, const std::string& serial 
   if (level >= std::min(g_logLevel, lh::LogLevel::Info)) g_logFile.Line(level, text, serial);
   if (level >= g_logLevel && VRDriverLog())
     VRDriverLog()->Log(("lh: [" + std::string(lh::LogLevelName(level)) + "] " + text + "\n").c_str());
+}
+
+SlowCall::~SlowCall() {
+  const double took = SteadyNow() - t0_;
+  if (took > limit_) Log(lh::LogLevel::Warn, std::string("slow ") + what_ + ": " + std::to_string(int(took * 1000)) + " ms" + (parts_.empty() ? "" : " (" + parts_ + ")"));
 }
 void Log(const std::string& text) { Log(lh::ClassifyLog(text), text); }
 
@@ -1314,16 +1336,29 @@ class Provider : public IServerTrackedDeviceProvider {
   }
 
   void Cleanup() override {
+    // SteamVR aborts (a "critical error") when quitting takes over ~11 s: each step's time is logged.
+    const double t0 = SteadyNow();
+    double last = t0;
+    std::string steps;
+    auto step = [&](const char* name) {
+      const double now = SteadyNow();
+      steps += std::string(steps.empty() ? "" : ", ") + name + " " + std::to_string(int((now - last) * 1000)) + " ms";
+      last = now;
+    };
     PowerOffForExit("SteamVR exiting");  // if EnterStandby didn't already
+    step("power-off");
     stop_ = true;
     if (thread_.joinable()) thread_.join();
+    step("main thread");
     if (reportThread_.joinable()) reportThread_.join();  // a report being saved finishes first
     g_telemetry.Stop();
+    step("report, telemetry");
     {
       std::lock_guard lock(radioMutex_);  // waits for a request being answered
       radioSession_ = nullptr;
     }
     if (session_) session_->Stop();
+    step("session");
     session_.reset();
     g_recorder.Close();
     devices_.clear();
@@ -1340,13 +1375,17 @@ class Provider : public IServerTrackedDeviceProvider {
     { std::lock_guard lock(eventMutex_); hapticEvents_.clear(); }
     loggedHaptic_.clear();
     loggedUnrouted_ = false;
+    step("state");
     stock_.Cleanup();
+    step("stock driver");
+    Log("shutdown took " + std::to_string(int((SteadyNow() - t0) * 1000)) + " ms (" + steps + ")");
     VR_CLEANUP_SERVER_DRIVER_CONTEXT();
   }
 
   const char* const* GetInterfaceVersions() override { return k_InterfaceVersions; }
 
   void RunFrame() override {
+    SlowCall slow("RunFrame");
     VREvent_t event;
     while (VRServerDriverHost()->PollNextEvent(&event, sizeof(event))) {
       stock_.PushEvent(event);  // the stock driver (headset display) sees the host's events too
@@ -1364,7 +1403,9 @@ class Provider : public IServerTrackedDeviceProvider {
       else if (path.empty()) Log("a head-mounted display is attached, but SteamVR's own lighthouse driver wasn't found to display it (" + std::string(kStockFile) + " or SteamVR's drivers/lighthouse)");
       else stock_.Load(path, context_, [](const std::string& text) { Log(text); });
     }
+    slow.Step("events, stock load");
     stock_.RunFrame();
+    slow.Step("stock driver");
     if (session_) {
       std::string expected;
       {
@@ -1377,6 +1418,7 @@ class Provider : public IServerTrackedDeviceProvider {
       } catch (const std::exception& e) {
         Log(std::string("pairing: ignored a request: ") + e.what());
       }
+      slow.Step("pairing");
     }
   }
 
@@ -1398,6 +1440,7 @@ class Provider : public IServerTrackedDeviceProvider {
   // here, as the stock driver does: if vrserver goes down on its way out, Cleanup may
   // never run.
   void EnterStandby() override {
+    SlowCall slow("EnterStandby");
     Log("SteamVR entering standby");
     PowerOffForExit("SteamVR entering standby");
   }
@@ -2066,6 +2109,10 @@ class Provider : public IServerTrackedDeviceProvider {
     if (cmd == "powerOff") return session_->PowerOff(serial) || (*error = serial + " can't be powered off", false);
     if (cmd == "enable") {
       session_->SetDeviceEnabled(serial, j.value("enabled", true));
+      return true;
+    }
+    if (cmd == "imu") {
+      session_->SetDeviceImuDisabled(serial, !j.value("enabled", true));
       return true;
     }
     if (cmd == "pair") {

@@ -13,17 +13,18 @@
 
 namespace openhouse::overlay {
 
-enum class NoticeKind { None, Replaced, Newer };
+enum class NoticeKind { None, Replaced, Newer, Firmware };
 // Update: confirmed (Fix for a replaced driver). Uninstall: a replaced driver's other way out.
 enum class NoticeAction { Update, Uninstall, Ignore };
 
 // What the check found, for the overlay's banner; shared by the dialog and the banner.
 struct NoticeState {
   NoticeKind kind = NoticeKind::None;
-  std::string tag;      // Newer: the release ("v1.0.5")
+  std::string tag;      // Newer: the release ("v1.0.5"); Firmware: what needs it, one per line
   bool handled = false; // updated or ignored: nothing to show any more
   bool updating = false;
   std::string error;    // the installer couldn't be started
+  int generation = 0;   // counts notices: one more firmware notice is a new one to show
 };
 NoticeState Notice();
 // The banner's text ("" when there's nothing to show).
@@ -35,6 +36,12 @@ std::string ClosingText(bool underSteamVR);
 // A newer release found by the overlay's own check (desktop window): the same banner.
 void OfferUpdate(const std::string& tag);
 
+// Watches the running driver (its telemetry) for the session: each Doorman Dongle that turns up
+// (at the start, plugged in or replugged) is checked for firmware, and its devices for radios, older
+// than what the installed openhouse came with; old ones are shown (dialog; the overlay's card and
+// headset notification too), again for every dongle plugged in later. Update starts the installer
+// with --dongles (Windows). Under Monado / WiVRn it returns once the driver goes away.
+void RunFirmwareCheck(bool underSteamVR);
 // The check for DRIVER_DIR (SteamVR/drivers/lighthouse/bin/<platform>); blocks while its dialog is
 // up. 0: nothing to say or an update offered, 1: the driver was replaced, 2: no folder.
 // underSteamVR: run by the overlay SteamVR started (what the confirmation lists).

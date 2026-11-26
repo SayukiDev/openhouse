@@ -12,7 +12,7 @@ openhouse-installer looks for it:
   firmwares/dongle/bank/<board>-a.bin, -b.bin         the firmware for bank A / B: what a running
                                                       dongle updates itself with (board: sd, nosd,
                                                       holyiot, pca10059, kuroshin)
-  firmwares/dongle/bank/version.txt                   their firmware version (hex, DONGLE_FW_VERSION):
+  firmwares/dongle/bank/version.txt                   their firmware version (hex, DONGLE_FW_VERSION, doorman/common/doorman_versions.h):
                                                       the installer offers an update to a dongle on any other
   firmwares/radio/doorman-radio-wm3.fw      every 2.0-era device (nRF52 radio)
   firmwares/radio/doorman-radio-neo.bin  VIVE Tracker 1.0 (nRF51 radio)
@@ -53,7 +53,7 @@ for board in ('sd', 'nosd', 'holyiot', 'pca10059', 'kuroshin'):
     for bank in 'ab':
         shutil.copy2(repo / f'doorman/dongle-fw/build/doorman_dongle_{board}_{bank}.bin', out / f'dongle/bank/{board}-{bank}.bin')
 import re
-version = re.search(r'#define\s+DONGLE_FW_VERSION\s+(0x[0-9A-Fa-f]+)', (repo / 'doorman/dongle-fw/src/dongle.h').read_text()).group(1)
+version = re.search(r'#define\s+DONGLE_FW_VERSION\s+(0x[0-9A-Fa-f]+)', (repo / 'doorman/common/doorman_versions.h').read_text()).group(1)
 (out / 'dongle/bank/version.txt').write_text(f'{int(version, 16):04X}\n')
 
 make('doorman/radio-fw')

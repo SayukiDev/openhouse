@@ -65,9 +65,9 @@ class Dongle:
             if not devs: raise IOError("Doorman Dongle (6767:0727) not found")
             path = next((d["path"] for d in devs if d.get("interface_number", 0) in (0, -1)), devs[0]["path"])
         self.h = hid.Device(path=path)
-        # interfaces 1..3: slot s streams on interface s % 4 (interface 0 also carries commands)
+        # interfaces 1..4: slot s streams on interface s % 5 (s % 4 before fw 0x002B; interface 0 also carries commands)
         self.hs = [hid.Device(path=d["path"]) for d in sorted(hid.enumerate(VID, PID), key=lambda d: d.get("interface_number", 0))
-                   if d.get("interface_number", 0) in (1, 2, 3) and d["path"] != path and d.get("serial_number") == self.h.serial]
+                   if d.get("interface_number", 0) >= 1 and d["path"] != path and d.get("serial_number") == self.h.serial]
         self._pending = []
         self._seq = 0
         self._frag = {}

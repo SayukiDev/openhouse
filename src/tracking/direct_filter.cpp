@@ -36,6 +36,7 @@ constexpr double kMaxAltBaseRot = 0.017453292519943295;     // 1°
 DirectFilter::DirectFilter() : P(Mat::Zero(kStateSize, kStateSize)), Q(Mat::Zero(kStateSize, kStateSize)) {}
 
 bool DirectFilter::CalibrationHealthy() const {
+  if (imuDisabled) return true;
   for (int i = 18; i < 31; ++i) if (!std::isfinite(x[i])) return false;
   if (std::abs(x[18] - 9.80665) > gravityTolerance ||
       x[28] * x[28] + x[29] * x[29] + x[30] * x[30] > 0.06853891945200943) return false;
@@ -69,7 +70,7 @@ void DirectFilter::InitialCovariance() {
 void DirectFilter::ComputeProcessNoise(double dt) {
   Q.diagonal().setZero();
   // pos/vel/acc: q·G·Gᵀ per axis with G = [dt²/2, dt, 1] (0x354560)
-  const double q = kJerkDensity;
+  const double q = imuDisabled ? 2.5 * kJerkDensity : kJerkDensity;
   const double dt2 = dt * dt;
   const double a = dt2 * dt2 * 0.25 * q;   // pos-pos
   const double b = dt * dt2 * 0.5 * q;     // pos-vel
@@ -86,7 +87,7 @@ void DirectFilter::ComputeProcessNoise(double dt) {
   }
   // quaternion / angular velocity block (0x3556d0)
   {
-    const double s = kOmegaDensity * dt;
+    const double s = (imuDisabled ? 3.0 * kOmegaDensity : kOmegaDensity) * dt;
     const double w = x[9], qx = x[10], qy = x[11], qz = x[12];
     const double aq = dt * 0.08333333333333333 * dt * s;  // s·dt²/12
     const double bq = dt * s * 0.25;
@@ -106,12 +107,15 @@ void DirectFilter::ComputeProcessNoise(double dt) {
     for (int r = 0; r < 3; r++)
       for (int k = 0; k < 3; k++) Q(kOmega + r, kOmega + k) = r == k ? s : 0.0;
   }
-  Q(16, 16) = Q(17, 17) = kGravTiltNoise * dt;
-  for (int i = 19; i < 22; i++) Q(i, i) = kGyroBiasNoise * dt;
-  Q(22, 22) = Q(23, 23) = kAccelBiasXYNoise * dt;
-  Q(24, 24) = kAccelBiasZNoise * dt;
-  for (int i = 25; i < 28; i++) Q(i, i) = dt * kAccelScaleNoise;
-  for (int i = 0; i < kStateSize; i++) Q(i, i) += kDiagEpsilon;
+  if (!imuDisabled) {
+    Q(16, 16) = Q(17, 17) = kGravTiltNoise * dt;
+    for (int i = 19; i < 22; i++) Q(i, i) = kGyroBiasNoise * dt;
+    Q(22, 22) = Q(23, 23) = kAccelBiasXYNoise * dt;
+    Q(24, 24) = kAccelBiasZNoise * dt;
+    for (int i = 25; i < 28; i++) Q(i, i) = dt * kAccelScaleNoise;
+  }
+  for (int i = 0; i < kStateSize; i++)
+    if (!imuDisabled || i < 16 || i >= 31) Q(i, i) += kDiagEpsilon;
 }
 
 void DirectFilter::Predict(double dtPos, double dtRot) {
@@ -186,21 +190,23 @@ bool DirectFilter::RejectCorrection(const Vec& dx) {
   for (int i = 0; i < dx.size(); i++)
     if (std::isnan(dx[i] - dx[i])) return refuse(kRejectNaN);
   auto d = [&](int i) { return i < dx.size() ? dx[i] : 0.0; };
-  const double rot = std::sqrt(d(30) * d(30) + d(28) * d(28) + d(29) * d(29));
-  if (kMaxImuRot < rot) return refuseValue(kRejectImuRot, rot, kMaxImuRot);
-  bool skipTilt = false;
-  if (updateCount < 0x105) {
-    const double g = std::fabs(d(18));
-    if (kMaxGravMag < g) return refuseValue(kRejectGravMag, g, kMaxGravMag);
-    if (updateCount < 0xc9) skipTilt = true;
-  } else {
-    if (kMaxImuRotConverged < rot) return refuseValue(kRejectImuRot, rot, kMaxImuRotConverged);
-    const double g = std::fabs(d(18));
-    if (kMaxGravMag < g) return refuseValue(kRejectGravMag, g, kMaxGravMag);
-    if (kMaxGravMagConverged < g) return refuseValue(kRejectGravMag, g, kMaxGravMagConverged);
+  if (!imuDisabled) {
+    const double rot = std::sqrt(d(30) * d(30) + d(28) * d(28) + d(29) * d(29));
+    if (kMaxImuRot < rot) return refuseValue(kRejectImuRot, rot, kMaxImuRot);
+    bool skipTilt = false;
+    if (updateCount < 0x105) {
+      const double g = std::fabs(d(18));
+      if (kMaxGravMag < g) return refuseValue(kRejectGravMag, g, kMaxGravMag);
+      if (updateCount < 0xc9) skipTilt = true;
+    } else {
+      if (kMaxImuRotConverged < rot) return refuseValue(kRejectImuRot, rot, kMaxImuRotConverged);
+      const double g = std::fabs(d(18));
+      if (kMaxGravMag < g) return refuseValue(kRejectGravMag, g, kMaxGravMag);
+      if (kMaxGravMagConverged < g) return refuseValue(kRejectGravMag, g, kMaxGravMagConverged);
+    }
+    const double tilt = std::sqrt(d(16) * d(16) + d(17) * d(17));
+    if (!skipTilt && kMaxGravTilt < tilt) return refuseValue(kRejectGravTilt, tilt, kMaxGravTilt);
   }
-  const double tilt = std::sqrt(d(16) * d(16) + d(17) * d(17));
-  if (!skipTilt && kMaxGravTilt < tilt) return refuseValue(kRejectGravTilt, tilt, kMaxGravTilt);
   const double w2 = d(13) * d(13) + d(14) * d(14) + d(15) * d(15);
   if (omegaCorrectionLimit2 <= w2) return refuseValue(kRejectOmega, std::sqrt(w2), std::sqrt(omegaCorrectionLimit2));
   for (int s = 0; s < 3; s++) {
@@ -296,6 +302,8 @@ bool DirectFilter::Update(const std::vector<Residual>& res, const Mat& R, const 
     // (testswing, held: none / calibration / + other bases / + tilt: tracking 87 / 95
     // / 92 / 98 %, the light used 42 / 52 / 90 / 84 %, jumps > 5 cm 142 / 58 / 67 / 3.)
     K.middleRows(16, std::min(n, 49) - 16).setZero();
+  } else if (imuDisabled && n > 16) {
+    K.middleRows(16, std::min(n, 31) - 16).setZero();
   } else if (holdImuCalibration && n > 30) {
     K.middleRows(18, 13).setZero();
   }
@@ -346,7 +354,7 @@ bool DirectFilter::Update(const std::vector<Residual>& res, const Mat& R, const 
   // 2026-10-22 (no fly-aways).
   if (gate && !frameGateOff && gateSigma > 0 && updateCount >= 200 && opticalRows > 0 &&
       2 * lastOutliers > opticalRows &&
-      dx.size() >= 3 && dx.head<3>().norm() > kFrameRejectMove) {
+      dx.size() >= 3 && dx.head<3>().norm() > frameRejectMove) {
     ++rejectedFrames;
     return false;
   }
