@@ -76,7 +76,11 @@ static inline uint32_t dmc_get(dmc_r_t *r, int n)
   }
   return v;
 }
+#if defined(_MSC_VER) && !defined(__clang__)   /* no __builtin_clz: the host build only (air_experiment.hpp) */
+static inline int dmc_bits32(uint32_t v) { int n = 0; while (v) { n++; v >>= 1; } return n; }
+#else
 static inline int dmc_bits32(uint32_t v) { return v ? 32 - __builtin_clz(v) : 0; }
+#endif
 static inline int dmc_bits(uint64_t v) { uint32_t h = (uint32_t)(v >> 32); return h ? 32 + dmc_bits32(h) : dmc_bits32((uint32_t)v); }
 static inline uint32_t dmc_zz(int32_t v) { return ((uint32_t)v << 1) ^ (uint32_t)(v >> 31); }
 static inline int32_t dmc_unzz(uint32_t v) { return (int32_t)(v >> 1) ^ -(int32_t)(v & 1); }
