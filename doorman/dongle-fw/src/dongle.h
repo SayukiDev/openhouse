@@ -3,7 +3,7 @@
 
 #define DONGLE_VID         0x6767
 #define DONGLE_PID         0x0727
-#define DONGLE_FW_VERSION  0x002A
+#define DONGLE_FW_VERSION  0x002B
 /* USB data interfaces: slot s streams on interface s % DONGLE_NIF (interface 0 also carries commands) */
 #define DONGLE_NIF         4
 #define STREAM_KIND        0x80   /* IN report: [0x80][slot][n][n bytes of [len][frame]... stream] */

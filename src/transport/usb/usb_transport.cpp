@@ -587,6 +587,15 @@ void UsbTransport::PumpDoorman(double now) {
       if (!dongle.IsOpen()) dongle.Open(f, now);
     }
   }
+  // Open dongles side by side share the hop channels out (by serial order), so they never meet on
+  // one; a dongle alone goes back to its own set. LH_DOORMAN_NO_HOP_SPLIT: left as they are.
+  static const bool noSplit = getenv("LH_DOORMAN_NO_HOP_SPLIT") != nullptr;
+  if (!noSplit) {
+    int open = 0, index = 0;
+    for (const auto& dongle : dongles) open += dongle->IsOpen();
+    for (const auto& dongle : dongles)
+      if (dongle->IsOpen()) dongle->SetHopChannels(DoormanHopChannels(index++, open));
+  }
   // No lock held: a device detaching here calls back into OnDeviceGone through the sink.
   for (const auto& dongle : dongles) dongle->Pump(now);
 }

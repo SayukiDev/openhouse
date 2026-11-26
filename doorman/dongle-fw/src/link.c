@@ -26,8 +26,16 @@ static uint32_t us_now(void) { NRF_TIMER1->TASKS_CAPTURE[0] = 1; return NRF_TIME
    reads as no names. UTF-8, NUL-padded; at most DML_NAME_MAX bytes (what one command carries). */
 #define NAME_MAGIC  0x4D4E484Fu        /* "OHNM" */
 #define DML_NAME_MAX 59
-typedef struct { uint32_t magic, used; uint8_t id[DML_SLOTS][8]; uint32_t names_magic; char name[DML_SLOTS][64]; } pair_store_t;
+/* Hop channels this dongle keeps to (cmd 0x36), bit k = dml_hop_ch[k]: dongles side by side get
+   sets with no channel in common, so they never meet on one. A page from older firmware ends before
+   it (erased: hop_magic is 0xFFFFFFFF), and reads as all 16. */
+#define HOP_MAGIC   0x4348484Fu        /* "OHHC" */
+#define HOP_MIN     4                  /* the fewest hop channels a dongle can be kept to */
+typedef struct { uint32_t magic, used; uint8_t id[DML_SLOTS][8]; uint32_t names_magic; char name[DML_SLOTS][64];
+                 uint32_t hop_magic, hop_allow; } pair_store_t;
 static pair_store_t pairs;
+static int mask_bits(uint32_t m) { int n = 0; for (; m; m &= m - 1) n++; return n; }
+static int hop_allow_ok(uint32_t m) { return m <= 0xFFFFu && mask_bits(m) >= HOP_MIN; }
 
 static void nvmc_wait(void) { while (!NRF_NVMC->READY) {} }
 typedef struct { uint32_t magic, used; uint8_t id[8][8]; uint32_t names_magic; char name[8][64]; } pair_store8_t;
@@ -41,12 +49,14 @@ static void pairs_load(void)
     memcpy(pairs.id, old->id, sizeof old->id);
     pairs.names_magic = NAME_MAGIC;
     if (old->names_magic == NAME_MAGIC) memcpy(pairs.name, old->name, sizeof old->name);
+    pairs.hop_magic = HOP_MAGIC; pairs.hop_allow = 0xFFFF;
     pairs_save();
     return;
   }
   memcpy(&pairs, (const void *)PAIR_PAGE, sizeof pairs);
   if (pairs.magic != PAIR_MAGIC) { memset(&pairs, 0, sizeof pairs); pairs.magic = PAIR_MAGIC; }
   if (pairs.names_magic != NAME_MAGIC) { memset(pairs.name, 0, sizeof pairs.name); pairs.names_magic = NAME_MAGIC; }
+  if (pairs.hop_magic != HOP_MAGIC || !hop_allow_ok(pairs.hop_allow)) { pairs.hop_magic = HOP_MAGIC; pairs.hop_allow = 0xFFFF; }
 }
 static void pairs_save(void)
 {
@@ -109,6 +119,9 @@ static uint8_t link_on = 1;
 static uint32_t net_base;
 static uint8_t cycle;
 static uint16_t mask = 0xFFFF, next_mask = 0xFFFF;
+/* The hop channels in use now (allow_mask) and asked for by cmd 0x36 (allow_want): taken at the start
+   of a cycle, so every POLL of a cycle announces the same next mask. */
+static uint16_t allow_mask = 0xFFFF, allow_want = 0xFFFF;
 static uint8_t cur_ch;
 
 /* per hop channel loss statistics (for adaptive hopping) */
@@ -556,6 +569,18 @@ static void join_beacon(void)
 #define CH_MIN_ON   8
 #define CH_BAD_PCT  8
 #define CH_EVERYWHERE_PCT 20
+/* Kept to fewer channels (cmd 0x36), 5 of every 8 stay on: with all 8 of 8 kept, a dongle sharing
+   the band with another could drop no channel at all. All 16: 8, as before. */
+static int ch_min_on(void) { const int n = mask_bits(allow_mask) * 5 / 8; return n < CH_MIN_ON ? n : CH_MIN_ON; }
+/* A new set of hop channels: the ones in use that are still in it stay as they are (on, or off for
+   their time); with too few of those left, all of the set. */
+static void allow_apply(void)
+{
+  allow_mask = allow_want;
+  uint16_t m = next_mask & allow_mask;
+  if (mask_bits(m) < ch_min_on()) m = allow_mask;
+  next_mask = m;
+}
 /* A channel is bad when it loses clearly more than the channels around it. Loss a device has on
    every channel (weak signal, body in the way) is not the channel's fault: judged on absolute loss,
    one weak device struck clean channels until only a few were left to hop on. */
@@ -574,7 +599,7 @@ static void channels_eval(void)
 {
   if (ms_ticks - ch_eval_ms < 2000) return;
   ch_eval_ms = ms_ticks;
-  uint16_t m = mask;
+  uint16_t m = next_mask & allow_mask;                       /* next_mask: mask, or the set cmd 0x36 just gave */
   int on = 0;
   for (int k = 0; k < DML_NHOP; k++) {
     chs[k].loss_pct = chs[k].polls ? (uint8_t)(100u * chs[k].lost / chs[k].polls) : 0;
@@ -593,7 +618,7 @@ static void channels_eval(void)
     for (int k = 0; k < DML_NHOP; k++)
       if ((m >> k) & 1 && chs[k].polls >= 20 && chs[k].loss_pct > bad &&
           (worst < 0 || chs[k].loss_pct > chs[worst].loss_pct)) worst = k;
-    if (worst < 0 || everywhere || on <= CH_MIN_ON) break;
+    if (worst < 0 || everywhere || on <= ch_min_on()) break;
     m &= (uint16_t)~(1u << worst); on--;
     uint32_t off = 30000u << (chs[worst].strikes < 4 ? chs[worst].strikes : 4);
     if (off > 300000u) off = 300000u;
@@ -602,9 +627,10 @@ static void channels_eval(void)
   }
   int back = -1;                                             /* one expired channel back per round */
   for (int k = 0; k < DML_NHOP; k++)
-    if (!((m >> k) & 1) && (int32_t)(ms_ticks - chs[k].off_until_ms) >= 0 &&
+    if (!((m >> k) & 1) && ((allow_mask >> k) & 1) && (int32_t)(ms_ticks - chs[k].off_until_ms) >= 0 &&
         (back < 0 || (int32_t)(chs[k].off_until_ms - chs[back].off_until_ms) < 0)) back = k;
-  if (back >= 0 || on == 0) { if (back < 0) back = 0; m |= (uint16_t)(1u << back); chs[back].off_until_ms = ms_ticks; }
+  if (back < 0 && on == 0) for (int k = DML_NHOP - 1; k >= 0; k--) if ((allow_mask >> k) & 1) back = k;
+  if (back >= 0) { m |= (uint16_t)(1u << back); chs[back].off_until_ms = ms_ticks; }
   for (int k = 0; k < DML_NHOP; k++) { chs[k].polls = 0; chs[k].lost = 0; }
   next_mask = m;
 }
@@ -629,6 +655,7 @@ void link_init(void)
   net_base = (h & 0x7F7F7F7Fu) | 0x01010101u;               /* per-dongle network address */
   fem_init();
   pairs_load();
+  allow_mask = allow_want = mask = next_mask = (uint16_t)pairs.hop_allow;
   for (int i = 0; i < DML_SLOTS; i++) { sl[i].last_seq = 7; sl[i].dseq = 0; }
 }
 
@@ -673,6 +700,7 @@ void link_poll(void)
   cycle++;
   mask = next_mask;
   cur_ch = dml_channel(cycle, mask);
+  if (allow_want != allow_mask) allow_apply();              /* announced in this cycle, hopped on from the next */
   channels_eval();                                          /* sets next_mask (announced in this cycle) */
   int k = 0;
   uint32_t missed = 0;
@@ -789,7 +817,7 @@ int link_stream_pop(uint8_t *rep, int itf)
 
 static void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 
-int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32..0x35; d = 61 bytes */
+int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32..0x36; d = 61 bytes */
 {
   uint8_t i = in[2] < DML_SLOTS ? in[2] : 0;
   slot_t *s = &sl[i];
@@ -900,7 +928,26 @@ int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32.
     d[0] = (uint8_t)mask; d[1] = (uint8_t)(mask >> 8);
     for (int k = 0; k < DML_NHOP; k++) { d[2 + k] = dml_hop_ch[k]; d[18 + k] = chs[k].loss_pct; }
     put32(d + 34, joins_heard); put32(d + 38, net_base);
+    d[42] = (uint8_t)allow_mask; d[43] = (uint8_t)(allow_mask >> 8);
     return 1;
+  case 0x36: {                                              /* hop channels: [op][mask lo][mask hi] */
+    /* op 0xFF: query. 0: back to the saved set. 1: this set until a restart (or op 0). 2: this set,
+       saved. A set has at least HOP_MIN channels (status 2 otherwise). The host gives dongles side
+       by side sets with no channel in common (op 1, and op 0 when one is left); op 2 is for a dongle
+       whose neighbour is on another computer. */
+    const uint16_t m = (uint16_t)(in[3] | in[4] << 8);
+    if (in[2] == 0) allow_want = (uint16_t)pairs.hop_allow;
+    else if (in[2] == 1 || in[2] == 2) {
+      if (!hop_allow_ok(m)) { *st = 2; return 1; }
+      allow_want = m;
+      if (in[2] == 2 && pairs.hop_allow != m) { pairs.hop_allow = m; pairs_save(); }
+    }
+    else if (in[2] != 0xFF) { *st = 2; return 1; }
+    d[0] = (uint8_t)allow_want; d[1] = (uint8_t)(allow_want >> 8);
+    d[2] = (uint8_t)pairs.hop_allow; d[3] = (uint8_t)(pairs.hop_allow >> 8);
+    d[4] = (uint8_t)next_mask; d[5] = (uint8_t)(next_mask >> 8);
+    return 1;
+  }
   }
   return 0;
 }

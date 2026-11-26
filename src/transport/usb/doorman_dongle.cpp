@@ -23,7 +23,7 @@ constexpr uint16_t kVid = 0x6767, kPid = 0x0727;
 constexpr double kExtraLatency = 0.0015;
 constexpr double kFeatureTimeout = 0.15;
 
-constexpr uint8_t kCmdRejoin = 0x33, kCmdSetName = 0x34, kCmdGetName = 0x35, kCmdPacked = 0x37, kCmdInfo = 0x01;
+constexpr uint8_t kCmdRejoin = 0x33, kCmdSetName = 0x34, kCmdGetName = 0x35, kCmdHopChannels = 0x36, kCmdPacked = 0x37, kCmdInfo = 0x01;
 constexpr size_t kNameMax = 59;   // what the dongle keeps (link.c DML_NAME_MAX)
 constexpr uint8_t kCmdDown = 0x21, kCmdStats = 0x23, kCmdPair = 0x24, kCmdSlots = 0x25, kCmdLive = 0x29, kCmdIdent = 0x2A;
 
@@ -208,8 +208,17 @@ void DoormanDongle::StopWriter() {
   writes_.clear();
 }
 
+uint16_t DoormanHopChannels(int index, int dongles) {
+  if (dongles < 2 || index < 0) return 0;
+  const int sets = std::min(dongles, 4);
+  uint16_t mask = 0;
+  for (int k = index % sets; k < 16; k += sets) mask |= uint16_t(1u << k);
+  return mask;
+}
+
 void DoormanDongle::Drop() {
   if (!dev_) return;
+  hopSent_ = -1;   // opened again (it may have restarted): told again
   StopWriter();
   // Each slot is forgotten as when its device turns off: plugged back in, the dongle's devices are
   // identified and attached again. Keeping the serial meant nothing re-attached them (listed in
@@ -280,6 +289,20 @@ void DoormanDongle::Downlink(int slot, const uint8_t* frame, size_t n) {
 void DoormanDongle::Pump(double now) {
   if (!dev_ && !TakeOpened()) return;   // the transport opens it again when it's listed again
   if (writeFailed_) { Drop(); return; }   // unplugged: the writer saw it first
+  if (hopWant_ >= 0 && (hopWant_ != hopSent_ || now >= nextHop_)) {
+    // [op][mask]: 1 = this set until the dongle restarts, 0 = back to its saved one.
+    const uint8_t a[3] = {uint8_t(hopWant_ ? 1 : 0), uint8_t(hopWant_), uint8_t(hopWant_ >> 8)};
+    if (hopWant_ != hopSent_ && (hopWant_ || hopSent_ > 0)) {   // not for a dongle alone from the start
+      char b[96];
+      if (hopWant_) std::snprintf(b, sizeof b, " hops on channel set 0x%04X (shared with the other dongles)", unsigned(hopWant_));
+      else std::snprintf(b, sizeof b, " hops on its own channel set");
+      log_(LogLevel::Info, "Doorman Dongle " + serial_ + b);
+    }
+    hopSent_ = hopWant_;
+    nextHop_ = now + 5.0;
+    Send(kCmdHopChannels, a, sizeof a);
+    if (!dev_) return;   // the write failed: closed
+  }
   if (now >= nextLive_) {
     nextLive_ = now + 0.25;
     for (int page = 0; page < 2; ++page) {   // 6 slots per reply

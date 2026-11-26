@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <bitset>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
@@ -789,6 +790,47 @@ TEST_F(Doorman, SplitFramesStayWithTheirDongle) {
   EXPECT_EQ(sink.Count(Serial(kA1) + ": connected on Doorman Dongle OHDG-TESTA slot 0"), 1u);
   EXPECT_EQ(sink.Count(Serial(kB1) + ": connected on Doorman Dongle OHDG-TESTB slot 0"), 1u);
   EXPECT_EQ(sink.attached.size(), 2u);
+}
+
+TEST(DoormanHop, SetsShareNoChannelAndCoverTheBand) {
+  EXPECT_EQ(lh::usb::DoormanHopChannels(0, 1), 0);   // alone: its own saved set
+  EXPECT_EQ(lh::usb::DoormanHopChannels(0, 2), 0x5555);
+  EXPECT_EQ(lh::usb::DoormanHopChannels(1, 2), 0xAAAA);
+  for (int n = 2; n <= 4; ++n) {
+    unsigned all = 0;
+    for (int i = 0; i < n; ++i) {
+      const unsigned m = lh::usb::DoormanHopChannels(i, n);
+      EXPECT_EQ(all & m, 0u) << n << " dongles, set " << i;
+      EXPECT_GE(std::bitset<16>(m).count(), 4u);   // the fewest the firmware takes (HOP_MIN)
+      all |= m;
+    }
+    EXPECT_EQ(all, 0xFFFFu);
+  }
+  EXPECT_EQ(lh::usb::DoormanHopChannels(4, 5), lh::usb::DoormanHopChannels(0, 5));   // a fifth shares a set
+}
+
+// Hop channel commands (0x36) to a dongle: [op][mask lo][mask hi].
+size_t HopCommands(const std::string& path, uint8_t op, uint16_t mask) {
+  return Sent(path, 0x36, [&](const auto& w) { return w[3] == op && w[4] == (mask & 0xFF) && w[5] == (mask >> 8); });
+}
+
+TEST_F(Doorman, TwoDonglesShareTheHopChannelsOutAndOneAloneTakesItsOwnBack) {
+  Plug("A", L"TESTA");
+  Step();
+  Step();
+  EXPECT_GE(HopCommands("A0", 0, 0), 1u);   // alone: its saved set
+  EXPECT_EQ(Sent("A0", 0x36, [](const auto& w) { return w[3] != 0; }), 0u);
+  Plug("B", L"TESTB");
+  Step();
+  Step();
+  EXPECT_GE(HopCommands("A0", 1, 0x5555), 1u);
+  EXPECT_GE(HopCommands("B0", 1, 0xAAAA), 1u);
+  EXPECT_EQ(HopCommands("B0", 0, 0), 0u);
+  const size_t before = HopCommands("A0", 0, 0);
+  fake::Unplug("B");
+  Step();   // B is closed
+  Step();
+  EXPECT_GT(HopCommands("A0", 0, 0), before);
 }
 
 TEST_F(Doorman, ATwoDongleRecordingReplaysUnambiguously) {

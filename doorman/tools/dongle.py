@@ -8,6 +8,9 @@
   dongle.py stats | link on|off | listen [SECS]   tracker link counters / frame rates
   dongle.py signal [SECS [SLOT]]     signal strength both ways + where polls get lost
   dongle.py slots | pair [SECS [SLOT [any]]] | forget SLOT|all | channels | slotstats SLOT
+  dongle.py hop [MASK|even|odd|all [save] | saved]   the hop channels it keeps to (bit k = k-th of 16):
+                                     dongles side by side take sets with no channel in common
+                                     (the driver does this by itself; save: kept on the dongle)
   dongle.py crash-test 1             deliberate HardFault (tests the crash record)
   dongle.py bank-update [DIR]        update over USB: write the bank it isn't running from
                                      DIR/doorman_dongle_<board>_a.bin / _b.bin, restart into it
@@ -165,6 +168,22 @@ def channels():
     for k in range(16):
         print(f"  {2400+d[2+k]} MHz  {'on ' if m >> k & 1 else 'OFF'}  loss {d[18+k]:3d}%")
     print("join requests heard", struct.unpack_from("<I", d, 34)[0], " network base", hex(struct.unpack_from("<I", d, 38)[0]))
+    allow = d[42] | d[43] << 8
+    if allow and allow != 0xFFFF: print(f"kept to hop channel set {allow:#06x} ({bin(allow).count('1')} of 16)")
+
+def hop(a):
+    """Hop channel set (cmd 0x36, firmware 0x002B+): op 0xFF query, 0 saved, 1 for now, 2 saved too."""
+    h = open_dev()
+    if not a: st, d = cmd(h, 0x36, bytes([0xFF]))
+    elif a[0] == "saved": st, d = cmd(h, 0x36, bytes([0]))
+    else:
+        m = {"even": 0x5555, "odd": 0xAAAA, "all": 0xFFFF}.get(a[0])
+        if m is None: m = int(a[0], 0)
+        st, d = cmd(h, 0x36, bytes([2 if len(a) > 1 and a[1] == "save" else 1, m & 0xFF, m >> 8]))
+    if st == 1: sys.exit("this firmware has no hop channel sets (needs 0x002B)")
+    if st: sys.exit("not a set of at least 4 of the 16 hop channels")
+    now, saved, mask = struct.unpack_from("<3H", d)
+    print(f"hop channels: {now:#06x} now, {saved:#06x} saved; in use {mask:#06x} ({bin(mask).count('1')} on)")
 
 def bank_update(folder):
     """Self-update of a two-bank board (dongle-fw/src/banks.h): no bootloader, no reset pin."""
@@ -218,6 +237,7 @@ def main():
         print("pairing open" + (f" for slot {slot}" if slot >= 0 else "") + (", any unknown device" if anyd else ""))
     elif c == "forget": cmd(open_dev(), 0x26, bytes([0xFF if len(a) < 2 or a[1] == "all" else int(a[1])])); slots()
     elif c == "channels": channels()
+    elif c == "hop": hop(a[1:])
     elif c == "codec":
         h = open_dev(); slot = int(a[1]) if len(a) > 1 else 0
         a0, b0, _ = struct.unpack_from("<3I", cmd(h, 0x28, bytes([slot]))[1]); time.sleep(3)

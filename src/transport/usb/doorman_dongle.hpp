@@ -63,6 +63,13 @@ std::vector<DoormanDongleFound> FindDoormanDongles(const hid_device_info* list,
 // hid_enumerate for the dongle's USB id, then FindDoormanDongles.
 std::vector<DoormanDongleFound> ScanDoormanDongles(std::map<std::string, int>* shared = nullptr);
 
+// The hop channels (bit k: the dongle's k-th of 16) for the index-th of `dongles` Doorman Dongles
+// running side by side: sets with no channel in common, spread over the whole band, so two dongles
+// never meet on a channel (both sweep the same 16 otherwise, and meet whenever their sweeps
+// cross). Up to four sets (4 channels each, the fewest a dongle takes); more dongles share them.
+// 0 with one dongle: its own saved set.
+uint16_t DoormanHopChannels(int index, int dongles);
+
 // Which dongle carries each device. A device paired to several dongles can show up on two at
 // once (it moves between them): the first keeps it, the others wait until it lets go, so a
 // device is never set up twice. Reader thread only (and Stop, after the reader has ended).
@@ -113,6 +120,10 @@ class DoormanDongle {
   // The user's name for a slot's device, kept on the dongle (firmware 0x0025+, cmd 0x34). Any
   // thread; false if the dongle isn't open.
   bool SetName(int slot, const std::string& name);
+  // The hop channels it keeps to (DoormanHopChannels; firmware 0x002B+, cmd 0x36; older firmware
+  // ignores it). 0: its saved set. Sent by Pump when it changes, when the dongle is opened, and
+  // every 5 s (a dongle that restarted, or a tool that set another). Reader thread.
+  void SetHopChannels(uint16_t mask) { hopWant_ = mask; }
   const std::string& Serial() const { return serial_; }   // any thread; also while it isn't open
   std::vector<DeviceId> Connected() const;
   // The device was reported gone: its slot shows none until the next stats refresh says otherwise.
@@ -240,6 +251,8 @@ class DoormanDongle {
   std::optional<int> pairMs_;
   std::vector<std::pair<int, std::string>> nameWrites_;   // SetName, sent by Pump; under mutex_
   double nextNames_ = 0;
+  int hopWant_ = -1, hopSent_ = -1;   // SetHopChannels: asked for, and sent (-1: nothing yet)
+  double nextHop_ = 0;
   int pairSlot_ = -1;
   std::vector<EndpointInfo> eps_;
   std::vector<SlotStat> statsCache_;   // under mutex_

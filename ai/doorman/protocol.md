@@ -131,6 +131,27 @@ frames = repeated [len][frame]
 * Once a second the radio sends `D [queue drops u16][reply drops u16]` (totals). The dongle
   keeps them per slot (cmd 0x28 bytes 12-19) and doesn't pass them on.
 
+### Several dongles (firmware 0x002B)
+* Addresses never clash (per-dongle network base), but every dongle sweeps the same 16 hop channels
+  in the same order, each at its own period. Two dongles are on one channel whenever the sweeps
+  cross: about 1/16 of the time with different periods; with the same number of devices the periods
+  are almost equal and the crossings last hundreds of ms (worked out from the schedule, not
+  measured). Adaptive hopping can't help: the other dongle is on every channel in turn, so no
+  channel stands out.
+* Each dongle can be kept to a **hop channel set** (cmd 0x36, a 16-bit mask over `dml_hop_ch`):
+  adaptive hopping only drops and brings back channels inside it, and keeps 5 of every 8 on
+  (8 of 16 as before). Dongles with sets that share no channel never meet. The set travels in the
+  POLL/JOIN mask like any mask change, so radios need no change, but a radio must take the mask
+  from the JOIN beacon (Index 0x6A000019 / Tracker 1.0 0x0A00000C and later): older ones wait on
+  hop channel 0 and can't join a dongle whose set leaves it out.
+* The driver hands the sets out (`DoormanHopChannels`, `UsbTransport::PumpDoorman`): open dongles by
+  serial order, 2: 0x5555 / 0xAAAA, 3: every third channel, 4 or more: every fourth (shared by a
+  fifth). Each set spans the whole band. Sent with op 1 (not saved), again every 5 s; a dongle
+  alone gets op 0 (its saved set). `LH_DOORMAN_NO_HOP_SPLIT` turns this off. For a neighbour on
+  another computer: `dongle.py hop even|odd save` on each.
+* Not solved by this: a dongle a few cm from another is deafened by its transmissions on any
+  channel (keep them apart, e.g. on a USB extension), and the JOIN channel (2480 MHz) is shared.
+
 ## Dongle USB interface (VID:PID 6767:0727, "Doorman Dongle")
 
 **Four HID interfaces** (firmware 0x000D), 64-byte reports, 1 ms interval (endpoints
@@ -172,7 +193,7 @@ and `doorman_link.py`. Older two-interface firmware isn't supported.
 | 0x24 | pair `[secs][slot+1]` |
 | 0x25 | slots `[first]`: 10 B per slot for slots first..first+5 (0 and 6): used, active, id x8. `d[60] = pairing \| (target+1) << 1`. The driver reads it every second: a slot whose id changes (re-paired to another device with no gap) is identified afresh |
 | 0x26 | forget slot (0xFF = all) |
-| 0x27 | channels: mask, loss % per hop channel, joins, net base |
+| 0x27 | channels: mask, loss % per hop channel, joins, net base; bytes 42-43: the hop channel set it is kept to (0x36) |
 | 0x28 | codec: air bytes, frame bytes, bad frames; the radio's queue drops, reply drops (u32 each); bytes 20-21: most bytes waiting for USB since the last read (u16); 22-25: test-load bytes queued (u32); 26-29 codec resyncs (u32), 30 CRC-8 on, 31 batches on |
 | 0x2B | test load `[slot mask][kB/s]`: filler `'Z'` frames queued for USB on those slots (empty ones too), as if devices sent them. `0 0` stops it. `doorman/tools/load.py dongle` |
 | 0x2C | USB inside radio exchanges `[bits, 0xFF keeps]`: 1 while the POLL goes out, 2 while listening, 4 between decoded frames. Default 3 (4 delays the next POLL: loss ~18%) |
@@ -183,6 +204,7 @@ and `doorman_link.py`. Older two-interface firmware isn't supported.
 | 0x33 | rejoin `[slot]`: the slot is not polled (for 1.5 s at most), so its radio rejoins (status 2: not paired). The host sends it when a connected device has sent nothing for 6 s |
 | 0x34 | set a slot's name `[slot][len][UTF-8, up to 59 B]`, len 0 clears (status 2: not paired or too long). Kept in flash with the pairings; forgetting or re-pairing the slot clears it |
 | 0x35 | a slot's name `[slot]` -> `[len][UTF-8]` |
+| 0x36 | hop channel set `[op][mask lo][mask hi]` (firmware 0x002B): op 0xFF query, 0 back to the saved set, 1 this set until a restart, 2 this set and saved (flash, with the pairings). At least 4 channels (status 2). Reply: set now, saved set, mask in use (u16 each). See "Several dongles" |
 | 0x29 | live `[first]` (6 slots per reply, as 0x25): per slot `[used\|active<<1][rssi last rx][rssi last tx][min][max][channel][ms since reply u32]`. Min/max reset on read |
 | 0x2A | identity: the slot's last `H` frame (16 B, zeros if none) |
 

@@ -46,6 +46,14 @@ responses win: 6 devices × 120 B = 6.3 ms cycle, ~18 kB/s each against ~8 kB/s 
 other limit: one 64 B report per ms per HID interface, hence two interfaces (even/odd slots). Realistic
 ceiling ≈ 8 devices per dongle (needs `DML_SLOTS` and the USB split changed); 16–20 only with worse latency.
 
+## Hop channel set (0x002B)
+
+`allow_mask` (cmd 0x36; saved in the pairing page after the names, magic "OHHC") bounds adaptive
+hopping, so dongles side by side can take sets with no channel in common (`protocol.md`, "Several
+dongles"). A new set is taken at the start of a cycle (`allow_apply`), so all of a cycle's POLLs
+announce the same next mask. Saving it erases the pairing page (the link stops for ~90 ms), so the
+driver's own sets are not saved (op 1).
+
 ## USB name, control path, hang detector (0x0019-0x001B)
 
 * Product string names the board: "Doorman Dongle Pro Micro" (sd/nosd UF2), "Doorman Dongle Holyiot",
