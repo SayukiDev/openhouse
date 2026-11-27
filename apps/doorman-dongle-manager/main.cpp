@@ -107,6 +107,7 @@ int main() {
       if (SnapshotDue(++frame, w, h)) break;
       glfwSwapBuffers(window);
     }
+    glfwHideWindow(window);   // gone at once: closing the dongles can take a moment (USB on Windows)
     ui.SaveSettings();
   }
   ImGui_ImplOpenGL2_Shutdown();

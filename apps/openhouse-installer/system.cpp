@@ -174,7 +174,9 @@ void CopyOver(const fs::path& from, const fs::path& to) {
     fs::create_symlink(fs::read_symlink(from), temp, ec);
   } else {
     fs::copy_file(from, temp, fs::copy_options::overwrite_existing, ec);
-    if (!ec) fs::permissions(temp, fs::status(from).permissions(), ec);
+    // Its permissions, and always writable by the owner: a copy out of the read-only Nix store
+    // kept them read-only.
+    if (!ec) fs::permissions(temp, fs::status(from).permissions() | fs::perms::owner_write, ec);
   }
   if (!ec) fs::rename(temp, to, ec);
   if (ec) throw std::runtime_error("Couldn't copy " + Utf8(from) + " to " + Utf8(to) + ": " + ec.message());

@@ -163,19 +163,11 @@ void OpenUrl(const std::string& url) {
 #endif
 }
 
-#ifndef _WIN32
-// Linux: no Update button for old firmware; where to do it instead.
-constexpr const char* kFirmwareHowTo = "Please run the installer and update your Doorman devices through the \"Update Dongles\" menu!";
-#endif
 bool g_underSteamVR = false;  // the overlay under SteamVR (else --check: Monado / WiVRn)
 
 std::string DialogText(const NoticeState& n) {
   if (n.kind == NoticeKind::Replaced) return "A SteamVR update replaced the openhouse driver.";
-#ifdef _WIN32
   if (n.kind == NoticeKind::Firmware) return "These need a firmware update:\n" + n.tag;
-#else
-  if (n.kind == NoticeKind::Firmware) return "These need a firmware update:\n" + n.tag + "\n\n" + kFirmwareHowTo;
-#endif
   return "openhouse " + n.tag + " is available (you have v" + std::string(lh::kVersion) + ").";
 }
 std::string ConfirmText(const NoticeState& n, NoticeAction a) {
@@ -313,17 +305,7 @@ int Ask(const std::string& text, const std::string& first, const std::string& se
   Log("no dialog tool: notification only");
   return 2;
 }
-// Information only, OK: zenity, else kdialog, else a notification.
-void Tell(const std::string& text) {
-  const std::string t = Quoted(kTitle), m = Quoted(text), env = DesktopEnv();
-  if (Have("zenity") && std::system((env + "zenity --info --width=440 --title=" + t + " --text=" + m + " >/dev/null 2>&1").c_str()) == 0) return;
-  if (Have("kdialog") && std::system((env + "kdialog --title " + t + " --msgbox " + m + " >/dev/null 2>&1").c_str()) == 0) return;
-  if (!Have("notify-send") || std::system((env + "notify-send -u critical " + t + " " + m + " >/dev/null 2>&1").c_str()) != 0)
-    std::fprintf(stderr, "%s: %s\n", kTitle, text.c_str());
-  Log("no dialog tool: notification only");
-}
 NoticeAction AskUser(const NoticeState& n) {
-  if (n.kind == NoticeKind::Firmware) { Tell(DialogText(n)); return NoticeAction::Ignore; }   // no Update here
   if (n.kind != NoticeKind::Replaced) return Ask(DialogText(n), "Update", "", "Ignore") == 0 ? NoticeAction::Update : NoticeAction::Ignore;
   const int r = Ask(DialogText(n), "Fix", "Uninstall openhouse", "Ignore");
   return r == 0 ? NoticeAction::Update : r == 1 ? NoticeAction::Uninstall : NoticeAction::Ignore;
@@ -381,11 +363,7 @@ std::string NoticeText() {
   const NoticeState n = Notice();
   if (n.kind == NoticeKind::None || n.handled) return {};
   if (n.kind == NoticeKind::Replaced) return "A SteamVR update replaced the openhouse driver";
-#ifdef _WIN32
   if (n.kind == NoticeKind::Firmware) return "Dongle or device firmware needs an update";
-#else
-  if (n.kind == NoticeKind::Firmware) return std::string("Dongle or device firmware needs an update. ") + kFirmwareHowTo;
-#endif
   return "openhouse " + n.tag + " is available";
 }
 

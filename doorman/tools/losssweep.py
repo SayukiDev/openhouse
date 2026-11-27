@@ -3,14 +3,19 @@
 average); per step, for each slot: answers lost (dongle), frames dropped on the device, IMU samples and light frames
 delivered per second over USB, and the device queue's peak (testdev slots).
 
-  losssweep.py [LOSSES] [BURST] [SECS]      LOSSES: comma-separated % (default 0,2,5,10,15,20,30)
+  losssweep.py [LOSSES] [BURST] [SECS] [SAVE_DIR]
+      LOSSES: comma-separated % (default 0,2,5,10,15,20,30). SAVE_DIR: every IMU sample of every slot per step
+      (lossL.csv: slot, host ms, device ms) and each step's per-slot results (summary.jsonl), for graphs
+IMU delay is measured for every slot whose IMU carries the device's 48 MHz time (test devices, Index family, HTC).
 Run without the driver (it would take the test devices' made-up IMU for real)."""
+import json
+import os
 import struct, sys, time, collections
 import testdev, load
 from doorman_link import Dongle
 
 
-def frame_rates(d, secs, test_slots):
+def frame_rates(d, secs, test_slots, save=None):
     """IMU and light frames per second per slot; for the test devices' IMU (device time in bytes 13-16, 48 MHz) also
     the delay over the fastest sample seen: p50 / p99 / max, ms."""
     imu, light = collections.Counter(), collections.Counter()
@@ -21,13 +26,15 @@ def frame_rates(d, secs, test_slots):
         for s, f in d.frames(raw=True, timeout_ms=20):
             if f[:1] == b'p':
                 imu[s] += 1
-                if s in test_slots and len(f) >= 17:
+                if len(f) >= 17:
                     raw = struct.unpack_from('<I', f, 13)[0]
                     prev = last.get(s)
                     if prev is not None and raw < prev[0] and prev[0] - raw > 1 << 31: wraps[s] += 1   # 48 MHz count wraps every ~89 s
                     last[s] = (raw,)
                     dev = (raw + wraps[s] * (1 << 32)) / 48000.0
-                    lag[s].append(time.time() * 1000 - dev)
+                    now = time.time() * 1000
+                    lag[s].append(now - dev)
+                    if save: save.write(f'{s},{now:.3f},{dev:.3f}\n')
             elif f[:1] == b's': light[s] += 1
     delay = {}
     for k, v in lag.items():
@@ -53,6 +60,8 @@ def main():
     losses = [int(x) for x in a[0].split(',')] if a else [0, 2, 5, 10, 15, 20, 30]
     burst = int(a[1]) if len(a) > 1 else 3
     secs = float(a[2]) if len(a) > 2 else 15
+    out = a[3] if len(a) > 3 else None
+    if out: os.makedirs(out, exist_ok=True)
     with Dongle() as d:
         d.cmd(0x37, b'\x01')
         n = d.slot_count()
@@ -65,8 +74,17 @@ def main():
             queue_peaks()                                    # resets the peaks
             m = load.measure(d, range(n), secs)
             qp = queue_peaks()
-            imu, light, delay = frame_rates(d, 15, set(qp))
+            save = open(os.path.join(out, f'loss{L}.csv'), 'w') if out else None
+            if save: save.write('slot,host_ms,device_ms\n')
+            imu, light, delay = frame_rates(d, 15, set(qp), save)
+            if save: save.close()
             t = load.timing(d)
+            if out:
+                with open(os.path.join(out, 'summary.jsonl'), 'a') as sf:
+                    sf.write(json.dumps({'loss': L, 'burst': burst, 'cycle_ms': t['cycle_ms'], 'answer': t['answer'], 'sat': t['sat'],
+                                         'test_slots': sorted(qp), 'slots': {k: {'lost': m[k]['loss'], 'dev_drops': m[k]['dev_drops'],
+                                         'imu_per_s': imu.get(k, 0), 'light_per_s': light.get(k, 0), 'delay_p50_p99_max': delay.get(k)}
+                                         for k in range(n)}}) + '\n')
             print(f'\n== injected loss {L} % (bursts of {burst})   cycle {t["cycle_ms"]} ms, answers {t["answer"]} B{" large" if t["large"] else ""}, saturation {t["sat"]} %')
             print(f'{"slot":>4} {"lost%":>6} {"dev drops/s":>11} {"IMU/s":>6} {"light/s":>8} {"queue peak":>10} {"IMU delay ms p50/p99/max":>26}')
             for k in range(n):

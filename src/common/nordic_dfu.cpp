@@ -8,9 +8,12 @@
 #include <map>
 #include <thread>
 
+#include <zlib.h>
+
 #ifdef _WIN32
 #include <windows.h>
 #include <setupapi.h>
+#include <cfgmgr32.h>
 #else
 #include <cerrno>
 #include <dirent.h>
@@ -130,6 +133,46 @@ std::vector<uint8_t> InitPacket(const std::vector<uint8_t>& app) {
   FieldBytes(command, 2, init);
   FieldBytes(packet, 1, command);  // Packet{command}: unsigned
   return packet;
+}
+
+// ---- signed init packets (Valve) ----
+struct PbField {
+  int field = 0, wire = 0;
+  uint64_t v = 0;
+  std::vector<uint8_t> b;
+};
+
+bool ReadVarint(const uint8_t*& p, const uint8_t* end, uint64_t* v) {
+  *v = 0;
+  for (int shift = 0; p < end && shift < 64; shift += 7) {
+    const uint8_t c = *p++;
+    *v |= uint64_t(c & 0x7F) << shift;
+    if (!(c & 0x80)) return true;
+  }
+  return false;
+}
+
+bool ParsePb(const std::vector<uint8_t>& msg, std::vector<PbField>* out) {
+  const uint8_t *p = msg.data(), *end = p + msg.size();
+  while (p < end) {
+    uint64_t key;
+    if (!ReadVarint(p, end, &key)) return false;
+    PbField f;
+    f.field = int(key >> 3);
+    f.wire = int(key & 7);
+    if (f.wire == 0) {
+      if (!ReadVarint(p, end, &f.v)) return false;
+    } else if (f.wire == 2) {
+      uint64_t n;
+      if (!ReadVarint(p, end, &n) || n > uint64_t(end - p)) return false;
+      f.b.assign(p, p + n);
+      p += n;
+    } else {
+      return false;
+    }
+    out->push_back(std::move(f));
+  }
+  return true;
 }
 
 // ---- serial port ----
@@ -434,7 +477,8 @@ std::vector<std::string> FindBootloaderPorts() {
   return out;
 }
 
-bool Flash(const std::string& portName, const Image& image, const std::function<void(float)>& progress, std::string* error) {
+bool Flash(const std::string& portName, const Image& image, const std::function<void(float)>& progress, std::string* error,
+           const std::vector<uint8_t>* initPacket) {
   Port port;
   if (!port.Open(portName, error)) return false;
   Dfu dfu(port);
@@ -448,8 +492,193 @@ bool Flash(const std::string& portName, const Image& image, const std::function<
   if (!dfu.Request({kMtu}, &p, 2.0, error)) return false;
   const size_t mtu = p.size() >= 2 ? size_t(p[0] | p[1] << 8) : 64;
   const size_t chunk = std::max<size_t>(16, (mtu - 1) / 2 - 1);  // room for SLIP escaping and the opcode
-  if (!dfu.SendObject(1, InitPacket(image.data), chunk, nullptr, error)) return false;
+  if (!dfu.SendObject(1, initPacket ? *initPacket : InitPacket(image.data), chunk, nullptr, error)) return false;
   return dfu.SendObject(2, image.data, chunk, progress, error);
+}
+
+// ---- Valve ----
+
+std::vector<ValvePort> FindValveBootloaders() {
+  constexpr unsigned kValveVid = 0x28DE, kValveDfuPid = 0x2104;
+  std::vector<ValvePort> out;
+#ifdef _WIN32
+  static const GUID kPorts = {0x4D36E978, 0xE325, 0x11CE, {0xBF, 0xC1, 0x08, 0x00, 0x2B, 0xE1, 0x03, 0x18}};
+  HDEVINFO set = SetupDiGetClassDevsW(&kPorts, nullptr, nullptr, DIGCF_PRESENT);
+  if (set == INVALID_HANDLE_VALUE) return out;
+  char want[32];
+  std::snprintf(want, sizeof want, "VID_%04X&PID_%04X", kValveVid, kValveDfuPid);
+  SP_DEVINFO_DATA info{};
+  info.cbSize = sizeof info;
+  for (DWORD i = 0; SetupDiEnumDeviceInfo(set, i, &info); ++i) {
+    char id[512] = {};
+    if (CM_Get_Device_IDA(info.DevInst, id, sizeof id - 1, 0) != CR_SUCCESS) continue;
+    std::string ids = id;
+    for (auto& c : ids) c = char(std::toupper(static_cast<unsigned char>(c)));
+    if (ids.find(want) == std::string::npos) continue;
+    // A composite device's interface has a made-up instance; the serial is on its parent.
+    if (ids.find("&MI_") != std::string::npos) {
+      DEVINST parent;
+      char pid[512] = {};
+      if (CM_Get_Parent(&parent, info.DevInst, 0) == CR_SUCCESS && CM_Get_Device_IDA(parent, pid, sizeof pid - 1, 0) == CR_SUCCESS)
+        ids = pid;
+    }
+    HKEY key = SetupDiOpenDevRegKey(set, &info, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
+    if (key == INVALID_HANDLE_VALUE) continue;
+    char name[64] = {};
+    DWORD size = sizeof name - 1, type = 0;
+    if (RegQueryValueExA(key, "PortName", nullptr, &type, reinterpret_cast<BYTE*>(name), &size) == ERROR_SUCCESS && type == REG_SZ)
+      out.push_back({name, ids.substr(ids.rfind('\\') + 1)});
+    RegCloseKey(key);
+  }
+  SetupDiDestroyDeviceInfoList(set);
+#else
+  auto read = [](const std::string& file) {
+    std::ifstream f(file);
+    std::string v;
+    std::getline(f, v);
+    return v;
+  };
+  if (DIR* dir = opendir("/sys/class/tty")) {
+    while (dirent* e = readdir(dir)) {
+      const std::string name = e->d_name;
+      if (name.rfind("ttyACM", 0) != 0) continue;
+      const std::string usb = "/sys/class/tty/" + name + "/device/../";
+      unsigned vid = 0, pid = 0;
+      try { vid = unsigned(std::stoul(read(usb + "idVendor"), nullptr, 16)); pid = unsigned(std::stoul(read(usb + "idProduct"), nullptr, 16)); } catch (...) { continue; }
+      if (vid == kValveVid && pid == kValveDfuPid) out.push_back({"/dev/" + name, read(usb + "serial")});
+    }
+    closedir(dir);
+  }
+  std::sort(out.begin(), out.end(), [](const ValvePort& a, const ValvePort& b) { return a.port < b.port; });
+#endif
+  for (auto& p : out)
+    for (auto& c : p.serial) c = char(std::toupper(static_cast<unsigned char>(c)));
+  return out;
+}
+
+bool ValveBootloaderInfo(const std::string& portName, uint32_t* version, uint32_t* appAddress, std::string* error) {
+  Port port;
+  if (!port.Open(portName, error)) return false;
+  Dfu dfu(port);
+  bool alive = false;
+  for (int i = 0; i < 6 && !alive; ++i) alive = dfu.Request({kPing, uint8_t(i + 1)}, nullptr, 0.5, error);
+  if (!alive) { *error = "the bootloader on " + portName + " didn't answer"; return false; }
+  std::vector<uint8_t> r;
+  if (!dfu.Request({0x0B, 1}, &r, 2.0, error)) return false;   // firmware version of image 1: the application
+  if (r.size() < 13) { *error = "short version reply"; return false; }
+  *version = Get32(r.data() + 1);
+  *appAddress = Get32(r.data() + 5);
+  return true;
+}
+
+void ValveBootloaderExit(const std::string& portName) {
+  Port port;
+  std::string error;
+  if (!port.Open(portName, &error)) return;
+  Dfu(port).Send({0x0C});   // abort: it resets into the application
+}
+
+bool ValveInitPacket(const std::vector<uint8_t>& dat, uint32_t version, const std::vector<uint8_t>& app,
+                     std::vector<uint8_t>* packet, uint32_t* hwVersion, std::string* error) {
+  // The reference: Packet{2: SignedCommand{1: Command{2: InitCommand}, 3: signature}}.
+  std::vector<uint8_t> init, sig;
+  std::vector<PbField> top;
+  if (ParsePb(dat, &top))
+    for (const auto& f : top) {
+      std::vector<PbField> sc;
+      if (f.field != 2 || f.wire != 2 || !ParsePb(f.b, &sc)) continue;
+      for (const auto& g : sc) {
+        std::vector<PbField> c;
+        if (g.field == 1 && g.wire == 2 && ParsePb(g.b, &c)) {
+          for (const auto& h : c)
+            if (h.field == 2 && h.wire == 2) init = h.b;
+        } else if (g.field == 3 && g.wire == 2) {
+          sig = g.b;
+        }
+      }
+    }
+  std::vector<PbField> in;
+  if (init.empty() || sig.size() != 64 || !ParsePb(init, &in)) { *error = "the reference package has no signed init packet"; return false; }
+  uint32_t hw = 0, type = 0, hashType = 3;
+  std::vector<uint8_t> sdReq;
+  for (const auto& h : in) {
+    if (h.field == 2 && h.wire == 0) hw = uint32_t(h.v);
+    else if (h.field == 3 && h.wire == 2) sdReq = h.b;   // packed varints, as they are
+    else if (h.field == 4 && h.wire == 0) type = uint32_t(h.v);
+    else if (h.field == 8 && h.wire == 2) {
+      std::vector<PbField> hh;
+      if (ParsePb(h.b, &hh))
+        for (const auto& x : hh)
+          if (x.field == 1 && x.wire == 0) hashType = uint32_t(x.v);
+    }
+  }
+  *hwVersion = hw;
+  std::vector<uint8_t> digest = Sha256(app);
+  std::reverse(digest.begin(), digest.end());
+  std::vector<uint8_t> ours, hash;
+  FieldVarint(ours, 1, version);
+  if (hw) FieldVarint(ours, 2, hw);
+  if (!sdReq.empty()) FieldBytes(ours, 3, sdReq);
+  FieldVarint(ours, 4, type);
+  FieldVarint(ours, 7, uint32_t(app.size()));
+  FieldVarint(hash, 1, hashType);
+  FieldBytes(hash, 2, digest);
+  FieldBytes(ours, 8, hash);
+  // Packet{1: Command{ours}, 2: SignedCommand{Command{ours}, ECDSA P-256, the reference's signature}}:
+  // this bootloader (SDK 15.2) checks the signature over the signed command and then acts on field 1.
+  auto command = [](const std::vector<uint8_t>& initCommand) {
+    std::vector<uint8_t> c;
+    FieldVarint(c, 1, 1);   // INIT
+    FieldBytes(c, 2, initCommand);
+    return c;
+  };
+  std::vector<uint8_t> signedCmd;
+  FieldBytes(signedCmd, 1, command(ours));
+  FieldVarint(signedCmd, 2, 0);
+  FieldBytes(signedCmd, 3, sig);
+  packet->clear();
+  FieldBytes(*packet, 2, signedCmd);
+  FieldBytes(*packet, 1, command(init));
+  return true;
+}
+
+bool ReadZipEntry(const std::string& zip, const std::string& name, std::vector<uint8_t>* out) {
+  std::ifstream in(zip, std::ios::binary);
+  const std::vector<uint8_t> z((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  auto u16 = [&](size_t o) { return o + 2 <= z.size() ? uint32_t(z[o] | z[o + 1] << 8) : 0u; };
+  auto u32 = [&](size_t o) { return o + 4 <= z.size() ? Get32(z.data() + o) : 0u; };
+  // The end of central directory record, then each entry.
+  size_t eocd = std::string::npos;
+  for (size_t i = z.size() >= 22 ? z.size() - 22 : 0; i + 22 <= z.size(); --i) {
+    if (u32(i) == 0x06054B50) { eocd = i; break; }
+    if (i == 0 || z.size() - i > 22 + 65535) break;
+  }
+  if (eocd == std::string::npos) return false;
+  size_t cd = u32(eocd + 16);
+  for (uint32_t k = 0, n = u16(eocd + 10); k < n && u32(cd) == 0x02014B50; ++k) {
+    const uint32_t method = u16(cd + 10), packed = u32(cd + 20), size = u32(cd + 24);
+    const uint32_t nameLen = u16(cd + 28), extra = u16(cd + 30), comment = u16(cd + 32), local = u32(cd + 42);
+    if (cd + 46 + nameLen > z.size()) return false;
+    const std::string entry(reinterpret_cast<const char*>(z.data() + cd + 46), nameLen);
+    cd += 46 + nameLen + extra + comment;
+    if (entry != name) continue;
+    if (u32(local) != 0x04034B50) return false;
+    const size_t data = local + 30 + u16(local + 26) + u16(local + 28);
+    if (data + packed > z.size()) return false;
+    if (method == 0) { out->assign(z.begin() + long(data), z.begin() + long(data + packed)); return true; }
+    if (method != 8) return false;
+    out->assign(size, 0);
+    z_stream s{};
+    if (inflateInit2(&s, -15) != Z_OK) return false;
+    s.next_in = const_cast<Bytef*>(z.data() + data);
+    s.avail_in = packed;
+    s.next_out = out->data();
+    s.avail_out = size;
+    const int r = inflate(&s, Z_FINISH);
+    inflateEnd(&s);
+    return r == Z_STREAM_END && s.total_out == size;
+  }
+  return false;
 }
 
 }  // namespace lh::dfu

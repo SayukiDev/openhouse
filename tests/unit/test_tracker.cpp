@@ -111,6 +111,129 @@ TEST(TrackerCore, AddsASecondaryBaseWithoutChangingPrimaryFrame) {
   EXPECT_TRUE(tracker.Filter().P.allFinite());
 }
 
+TEST(TrackerCore, LateLightFromAnEarlierPoseHasNoRejectedRows) {
+  const auto model = Object();
+  lh::LighthouseDirect tracker(model);
+  lh::BaseConfig base;
+  base.valid = true; base.serial = 123; base.cal.resize(14);
+  tracker.OnBaseConfig(base, {});
+  tracker.SetImprovements(true, 4.0, true);
+  lh::LighthouseDirect::Seed seed;
+  seed.base = 123; seed.time = 1.25; seed.calibrated = true;
+  seed.baseFromImu.translation() = Eigen::Vector3d(1.0, 0, -2);
+  ASSERT_TRUE(tracker.SeedPose(seed));
+
+  // Both sweeps see the device at (0, 0, -2), a metre from the current estimate.
+  lh::LighthouseDirect::RecoveryEvidence recovery{-1};
+  EXPECT_FALSE(tracker.OnFrame(Frame(model, 0), &recovery));
+  EXPECT_EQ(recovery.rejectedRows, 0);
+  EXPECT_EQ(tracker.Filter().rejectedFrames, 0u);
+  EXPECT_DOUBLE_EQ(tracker.LastOpticalTime(), seed.time);
+
+  EXPECT_FALSE(tracker.OnFrame(Frame(model, 30), &recovery));
+  EXPECT_GE(recovery.rejectedRows, 4);
+  EXPECT_EQ(tracker.Filter().rejectedFrames, 1u);
+}
+
+TEST(TrackerCore, RejectedOpticalRowsExcludeGatedOutliers) {
+  const auto model = Object();
+  lh::LighthouseDirect tracker(model);
+  lh::BaseConfig base;
+  base.valid = true; base.serial = 123; base.cal.resize(14);
+  tracker.OnBaseConfig(base, {});
+  tracker.SetImprovements(true, 4.0, true);
+  lh::LighthouseDirect::Seed seed;
+  seed.base = 123; seed.time = 1.0; seed.calibrated = true;
+  seed.baseFromImu.translation() = Eigen::Vector3d(0, 0, -2);
+  ASSERT_TRUE(tracker.SeedPose(seed));
+  auto& filter = tracker.FilterForTest();
+  filter.P *= 1e-6;
+  filter.omegaCorrectionLimit2 = 0.0;  // Force rejection after the per-row gate.
+  auto frame = Frame(model, 0);
+  frame.samples.resize(4);
+  frame.samples.back().angle += 0.025;
+
+  lh::LighthouseDirect::RecoveryEvidence recovery;
+  EXPECT_FALSE(tracker.OnFrame(frame, &recovery));
+  ASSERT_EQ(filter.gatedRows, 1u);
+  EXPECT_EQ(recovery.rejectedRows, 3);
+}
+
+TEST(TrackerCore, OpticalCorrectionUsesAccelerometerClippingWindow) {
+  const auto model = Object();
+  const auto check = [&](double elapsed, uint32_t saturation, bool swing, bool accepted) {
+    SCOPED_TRACE(elapsed);
+    SCOPED_TRACE(saturation);
+    SCOPED_TRACE(swing);
+    lh::LighthouseDirect tracker(model);
+    lh::BaseConfig base;
+    base.valid = true; base.serial = 123; base.cal.resize(14);
+    tracker.OnBaseConfig(base, {});
+    tracker.SetImprovements(true, 0.01, swing);
+    lh::LighthouseDirect::Seed seed;
+    seed.base = 123; seed.time = 1.0; seed.calibrated = true;
+    seed.baseFromImu.translation() = Eigen::Vector3d(0.20, 0, -2);
+    ASSERT_TRUE(tracker.SeedPose(seed));
+    lh::ImuSample clipped;
+    clipped.time = seed.time;
+    clipped.accel = {0, 9.80665, 0};
+    clipped.saturated = saturation;
+    tracker.OnImu(clipped);
+    auto frame = Frame(model, 0);
+    for (auto& sample : frame.samples) sample.time = seed.time + elapsed - sample.width / 2;
+    lh::LighthouseDirect::RecoveryEvidence recovery;
+    EXPECT_EQ(tracker.OnFrame(frame, &recovery), accepted);
+    EXPECT_GT(tracker.Filter().lastOutliers, 3);
+    EXPECT_EQ(tracker.Filter().rejectedFrames, accepted ? 0u : 1u);
+    EXPECT_EQ(recovery.rejectedRows, accepted ? 0 : 6);
+    EXPECT_DOUBLE_EQ(tracker.LastOpticalTime(), seed.time + (accepted ? elapsed : 0));
+    EXPECT_FALSE(tracker.Filter().frameGateOff);
+  };
+  check(0.125, 0x1, true, true);
+  check(0.250, 0x1, true, false);
+  check(0.375, 0x1, true, false);
+  check(0.125, 0x8, true, false);
+  check(0.125, 0x1, false, false);
+}
+
+TEST(TrackerCore, OpticalOnlyRecoveryUsesFilterTime) {
+  const auto model = Object();
+  lh::LighthouseDirect tracker(model);
+  lh::BaseConfig base;
+  base.valid = true; base.serial = 123; base.cal.resize(14);
+  tracker.OnBaseConfig(base, {});
+  tracker.SetImprovements(true, 4.0, true);
+  tracker.SetImuDisabled(true);
+  lh::LighthouseDirect::Seed seed;
+  seed.base = 123; seed.time = 1.25; seed.calibrated = true;
+  seed.baseFromImu.translation() = Eigen::Vector3d(1, 0, -2);
+  ASSERT_TRUE(tracker.SeedPose(seed));
+  lh::ImuSample observation;
+  observation.time = 1.5;
+  tracker.OnImu(observation);
+  auto& filter = tracker.FilterForTest();
+  filter.x[6] = 0.25;
+  lh::LighthouseDirect::RecoveryEvidence recovery;
+  EXPECT_FALSE(tracker.OnFrame(Frame(model, 0), &recovery));
+  EXPECT_EQ(recovery.rejectedRows, 0);
+  EXPECT_FALSE(tracker.OnFrame(Frame(model, 30), &recovery));
+  EXPECT_GE(recovery.rejectedRows, 4);
+  EXPECT_DOUBLE_EQ(filter.x[6], 0.25);
+  EXPECT_DOUBLE_EQ(tracker.LastOpticalTime(), seed.time);
+
+  filter.x[0] = 0;
+  filter.P.row(6).setZero();
+  filter.P.col(6).setZero();
+  auto frame = Frame(model, 30);
+  for (auto& sample : frame.samples) sample.time = seed.time + 0.0001 - sample.width / 2;
+  EXPECT_TRUE(tracker.OnFrame(frame, &recovery));
+  EXPECT_EQ(recovery.rejectedRows, 0);
+  EXPECT_GT(tracker.LastOpticalTime(), seed.time);
+  EXPECT_LT(tracker.LastOpticalTime(), observation.time);
+  EXPECT_TRUE(filter.holdImuCalibration);
+  EXPECT_NEAR(filter.x[6], 0.125, 1e-5);
+}
+
 TEST(TrackerCore, RecordedTiltSeedsStateAndUncertainty) {
   const auto model = Object();
   lh::LighthouseDirect tracker(model);

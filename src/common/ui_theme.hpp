@@ -67,7 +67,7 @@ inline ImVec4 CardColor() { return ImVec4(0.11f, 0.122f, 0.157f, 0.92f); }
 
 enum class Icon {
   Download, Refresh, Trash, Chip, Restore, BaseStation, Wireless, Dongle, Tracker, Wire,
-  Overview, Map, Settings, Debug, About, Slots, Channels, Record, Folder, Wrench
+  Overview, Map, Settings, Debug, About, Slots, Channels, Record, Folder, Wrench, Headset
 };
 
 inline void Arc(ImDrawList* dl, ImVec2 c, float r, float a0, float a1, ImU32 col, float th) {
@@ -230,6 +230,24 @@ inline void DrawIcon(ImDrawList* dl, Icon icon, ImVec2 c, float s, ImU32 col) {
       dl->AddCircle(c, h * 0.8f, col, 32, th);
       dl->AddCircleFilled(c, h * 0.42f, col, 24);
       break;
+    case Icon::Headset: {  // a headset from the front: the strap over the top, the faceplate, its cameras
+      const float t = th * 0.75f;
+      const auto B = [&](float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3) {
+        dl->AddBezierCubic(P(x0, y0), P(x1, y1), P(x2, y2), P(x3, y3), col, t);
+      };
+      const auto L = [&](float x0, float y0, float x1, float y1) { dl->AddLine(P(x0, y0), P(x1, y1), col, t); };
+      B(-0.7f, -0.3f, -0.6f, -0.95f, 0.6f, -0.95f, 0.7f, -0.3f);
+      L(-0.78f, -0.35f, 0.78f, -0.35f);
+      for (float k : {1.f, -1.f}) {   // each side, mirrored
+        B(0.78f * k, -0.35f, 0.95f * k, -0.35f, 0.95f * k, -0.2f, 0.93f * k, -0.05f);
+        L(0.93f * k, -0.05f, 0.86f * k, 0.42f);
+        B(0.86f * k, 0.42f, 0.84f * k, 0.52f, 0.78f * k, 0.55f, 0.68f * k, 0.55f);
+        L(0.68f * k, 0.55f, 0.22f * k, 0.55f);
+        dl->AddCircleFilled(P(0.62f * k, 0.33f), h * 0.1f, col, 16);
+      }
+      B(0.22f, 0.55f, 0.15f, 0.3f, -0.15f, 0.3f, -0.22f, 0.55f);   // the nose
+      break;
+    }
     case Icon::Folder: {
       const ImVec2 pts[] = {P(-0.85f, -0.6f), P(-0.25f, -0.6f), P(-0.1f, -0.4f), P(0.85f, -0.4f), P(0.85f, 0.7f), P(-0.85f, 0.7f)};
       dl->AddPolyline(pts, 6, col, ImDrawFlags_Closed, th);

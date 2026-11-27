@@ -123,6 +123,10 @@ class RoomMap {
   uint32_t OriginGauge() const;  // the base held fixed meanwhile; 0 if none
   void ApplyOriginSolved(const Eigen::Isometry3d& worldFromOrigin, double positionVariance, int keyframes);
   uint64_t OriginEpoch() const { return originEpoch_; }  // bumps when the origin was re-placed
+  // The room's level has stopped changing (no new level for a minute) and is applied: nothing gliding in.
+  bool LevelSettled() const;
+  // An origin's level from a base accelerometer or from SteamVR's database: devices will refine it.
+  static constexpr double kImportedLevelVariance = 1.5e-4;
   // A solve for a base far outside what the room and the solve allow (a moved base).
   bool FarOff(uint32_t serial, const Eigen::Isometry3d& worldFromBase, double positionVariance,
               double rotationVariance) const;
@@ -163,6 +167,7 @@ class RoomMap {
   std::vector<uint32_t> relearned_;
   bool frozen_ = false;
   std::optional<Eigen::Matrix3d> levelTarget_;  // where RefineOriginTilt is turning the room
+  double levelTargetAt_ = std::numeric_limits<double>::quiet_NaN();  // when it was last set
   double levelTime_ = std::numeric_limits<double>::quiet_NaN(), advanceTime_ = std::numeric_limits<double>::quiet_NaN();
   std::map<uint32_t, Eigen::Isometry3d> solvedTarget_;
   bool levelled_ = false;  // the session's first level is applied at once

@@ -172,6 +172,7 @@ struct SessionSnapshot {
   uint64_t roomRevision = 0;
   std::string roomId;
   uint64_t originEpoch = 0;  // bumps when a knocked origin base was re-placed in the room
+  bool levelSettled = false;  // the room's level (gravity) is known and applied (RoomMap::LevelSettled)
 };
 
 enum class SessionEventType {

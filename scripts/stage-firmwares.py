@@ -9,6 +9,7 @@ openhouse-installer looks for it:
   firmwares/dongle/doorman-pca10059.hex               Nordic nRF52840 Dongle PCA10059 (same)
   firmwares/dongle/doorman-kuroshin.hex               Kuroshin dongle (same; DFU only by its reset pads)
     (the above are what a bootloader installs: boot stub + firmware, for a first install or a rescue)
+  firmwares/dongle/doorman-index.bin                  Valve Index HMD radio (one image at 0x26000, Valve's serial DFU)
   firmwares/dongle/bank/<board>-a.bin, -b.bin         the firmware for bank A / B: what a running
                                                       dongle updates itself with (board: sd, nosd,
                                                       holyiot, pca10059, kuroshin)
@@ -39,7 +40,14 @@ image = repo / 'basestation_firmware/build/firmware.bin'
 data = image.read_bytes()
 if sum(int.from_bytes(data[i:i + 4], 'little') for i in range(0, 32, 4)) % 2**32:
     sys.exit('lhbs: bad vector checksum')
-commit = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', '--short', 'HEAD'], text=True).strip()
+# The commit, from git, or (no checkout: the Nix flake) OPENHOUSE_BUILD_COMMIT.
+import os
+commit = os.environ.get('OPENHOUSE_BUILD_COMMIT', '').removesuffix('-dirty')
+if not commit:
+    try:
+        commit = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', '--short', 'HEAD'], text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        commit = 'local'   # no checkout and no commit given (as the CMake version stamp says)
 shutil.copy2(image, out / 'basestation' / f'lhbs-{datetime.date.today():%Y%m%d}-{commit}.bin')
 
 make('doorman/dongle-fw')
@@ -48,6 +56,7 @@ shutil.copy2(repo / 'doorman/dongle-fw/build/doorman_dongle_nosd.uf2', out / 'do
 shutil.copy2(repo / 'doorman/dongle-fw/build/doorman_dongle_holyiot.hex', out / 'dongle/doorman-holyiot.hex')
 shutil.copy2(repo / 'doorman/dongle-fw/build/doorman_dongle_pca10059.hex', out / 'dongle/doorman-pca10059.hex')
 shutil.copy2(repo / 'doorman/dongle-fw/build/doorman_dongle_kuroshin.hex', out / 'dongle/doorman-kuroshin.hex')
+shutil.copy2(repo / 'doorman/dongle-fw/build/doorman_dongle_idx.bin', out / 'dongle/doorman-index.bin')
 (out / 'dongle/bank').mkdir()
 for board in ('sd', 'nosd', 'holyiot', 'pca10059', 'kuroshin'):
     for bank in 'ab':

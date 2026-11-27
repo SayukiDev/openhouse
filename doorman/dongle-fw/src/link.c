@@ -9,16 +9,12 @@
 #include "sizing.h"
 #include "link.h"
 #include "dongle.h"
+#include "banks.h"
 
 extern volatile uint32_t ms_ticks;
 static uint32_t us_now(void) { NRF_TIMER1->TASKS_CAPTURE[0] = 1; return NRF_TIMER1->CC[0]; }
 
 /* ---------------- paired trackers (persisted in the last app flash page) ---------------- */
-#if BOARD_NORDIC_DFU
-#define PAIR_PAGE   0xDA000u           /* storage page; Nordic's open bootloader owns 0xE0000+ */
-#else
-#define PAIR_PAGE   0xEC000u
-#endif
 #define PAIR_MAGIC  0x3150484Fu        /* "OHP1": DML_SLOTS slots */
 #define PAIR_MAGIC8 0x5250484Fu        /* "OHPR": the 8-slot page of fw 0x0029 and earlier, moved over at boot */
 /* Names (cmd 0x34/0x35), the user's own for each paired device, kept here so they go wherever the
@@ -93,6 +89,7 @@ typedef struct {
   uint8_t dup_run;                      /* consecutive out-of-order answers (a stalled uplink) */
   uint8_t check;                        /* its radio adds the codec CRC-8 (JREQ DML_JF_CHECK) */
   uint8_t batch;                        /* its radio sends batches (JREQ DML_JF_BATCH) */
+  uint32_t rx_t, imu_q_t;               /* latency (cmd 0x3A): its last answer in, its last IMU sample queued */
   uint16_t batch_mismatch;              /* answers that didn't match the agreed batches: made to rejoin */
   /* a batch being decoded, a frame a step; its frames held until its CRC-8 passes, so a corrupted one
      never reaches the host */
@@ -172,6 +169,13 @@ static uint8_t usb_in_radio = 2;
 #define EX_BUCKETS 50                         /* 50 us each, up to 2.5 ms */
 static uint16_t ex_hist[EX_BUCKETS]; static uint32_t ex_hn;
 #define SLOT_GUARD_US 120u
+#define JOIN_TAIL_US 100u                                    /* a cycle without a join window: after its last slot */
+/* Test switches (cmd 0x3B), off at power-on: the join window in every cycle (as before 0x002E), slots left
+   out of the cycle (their devices drop out and rejoin when let back in), and answers dropped as if lost. */
+static uint8_t test_join_always, test_drop_pct;
+static uint16_t test_skip;
+static uint32_t test_rng = 0x2545F491u;
+static uint32_t cycle_len = 2000;
 static uint8_t adaptive = 1, repoll = 0;   /* repoll: tried, ~8% of re-polls were answered (a miss repeats on the same channel) */
 static uint32_t repolls, repolls_ok;
 /* Ghost-follow (cmd 0x32, on by default). A device that missed the one POLL announcing a new mask (or period) keeps
@@ -213,6 +217,10 @@ static int upq_push(slot_t *s, const uint8_t *f, int gl)
 /* Decodes one frame of a slot's kept answer (in order: the air codec's state follows every frame);
    0 when there's nothing left. */
 static uint32_t dec_sum, dec_n, dec_max;
+/* Latency counters (cmd 0x3A, cleared by each read), 250 us buckets, the last open-ended: dec, from an answer's
+   end to its IMU sample decoded and queued for USB; usb, from that to the report carrying it being queued. */
+static uint16_t h_dec[8], h_usb[8];
+static void lat_hist(uint16_t *h, uint32_t us) { uint32_t b = us / 250u; h[b > 7 ? 7 : b]++; }
 /* A decoded frame on its way to the host. */
 static void deliver(slot_t *s, const uint8_t *f, int gl)
 {
@@ -222,8 +230,15 @@ static void deliver(slot_t *s, const uint8_t *f, int gl)
     const uint32_t v = (uint32_t)f[2] | (uint32_t)f[3] << 8 | (uint32_t)f[4] << 16 | (uint32_t)f[5] << 24;
     if (k >= 0 && k < DML_SLOTS && ((pairs.used >> k) & 1) && v && pairs.radio[k] != v) { pairs.radio[k] = v; pairs_dirty = 1; }
   }
+  if (f[0] == 0xF0 && f[1] == '[' && gl >= 3 && f[2] == 0) {   /* a new radio committed: its version is unknown */
+    const int k = (int)(s - sl);                            /* until it says (or the installer sets it, 0x39) */
+    if (k >= 0 && k < DML_SLOTS && pairs.radio[k]) { pairs.radio[k] = 0; pairs_dirty = 1; }
+  }
   if (f[0] == 'D' && gl >= 5) { s->dev_drops = (uint16_t)(f[1] | f[2] << 8); s->dev_reply_drops = (uint16_t)(f[3] | f[4] << 8); }
-  else { s->frames_up++; s->bytes_up += (uint32_t)gl; upq_push(s, f, gl); }
+  else {
+    s->frames_up++; s->bytes_up += (uint32_t)gl;
+    if (upq_push(s, f, gl) && f[0] == 'p' && gl == 18) { const uint32_t t = us_now(); lat_hist(h_dec, t - s->rx_t); s->imu_q_t = t; }
+  }
 }
 /* Not what the radio coded: the coders are out of step for good (every frame after it decodes as
    garbage). Left alone past the radio's 1 s "dongle gone", it rejoins and both ends reset. */
@@ -398,6 +413,10 @@ static int poll_slot(uint8_t i, uint8_t ch, uint32_t t_tx)   /* 1: it answered; 
   else ghost_polls++;                                       /* ghost polls stay out of the channel statistics */
   if (hop >= 0) chs[hop].polls++;
   int n = txrx(ch, net_base, (uint8_t)(DML_SLOT_PREFIX + i), 400);
+  if (test_drop_pct && n > 0) {                             /* test: lost as if in the air (the device resends) */
+    test_rng = test_rng * 1664525u + 1013904223u;
+    if ((test_rng >> 16) % 100u < test_drop_pct) n = -2;
+  }
   const uint8_t *r = pkt_rx + 1;
   if (n < DML_RESP_HDR || r[0] != DML_RESP || r[1] != i) {
     if (n == -3) s->crc_err++; else s->timeouts++;
@@ -449,6 +468,7 @@ static int poll_slot(uint8_t i, uint8_t ch, uint32_t t_tx)   /* 1: it answered; 
   sizing_answer(&sizing, i, n, r[2], s->check, plan_n);   /* radios with the CRC-8 set the "more" flag too */
   /* Kept and decoded while the radio is busy with the next exchange (decode_some): decoding here took
      ~320 us of each ~870 us exchange (up to 720) with the radio idle, every slot waiting on it. */
+  s->rx_t = us_now();
   memcpy(s->pend, r + DML_RESP_HDR, (size_t)(n - DML_RESP_HDR));
   s->pend_n = (uint8_t)(n - DML_RESP_HDR); s->pend_k = 0;
   if (s->held) {
@@ -686,7 +706,7 @@ void link_poll(void)
     if (sl[i].skip_until && !slot_skipping(&sl[i])) sl[i].skip_until = 0;   /* over (and no wrap later) */
     /* A skipping slot keeps its place, with no POLL in it: the cycle's length and every other
        slot's time stay as they were (and so does where they fall against another dongle's). */
-    if (((pairs.used >> i) & 1) && sl[i].active) { plan |= 1u << i; n++; }
+    if (((pairs.used >> i) & 1) && sl[i].active && !((test_skip >> i) & 1)) { plan |= 1u << i; n++; }
   }
   /* bigger responses amortise the ~450 us per-slot overhead: 6 x 120 B = 6.3 ms cycle, ~18 kB/s per device
      (72 B gave 12.9 kB/s, too little headroom for resends; queues overflowed). 7-8 devices: 176 B, 9.9 ms
@@ -706,8 +726,14 @@ void link_poll(void)
      rarely full, so the cycle is shorter and every device is polled more often. Off: cmd 0x2D 0. */
   const uint32_t worst = 450u + 4u * max_resp;
   slot_us = adaptive && ex_budget ? (ex_budget + SLOT_GUARD_US < worst ? ex_budget + SLOT_GUARD_US : worst) : worst;
-  period_us = n * slot_us + 700u;
-  t_c += period_us;
+  /* The join window (700 us) only in the cycles that send a JOIN beacon (every 20 ms): every cycle kept
+     it, and at a 4.5 ms cycle three in four carried 700 us of nothing (15% of the cycle, longer between
+     each device's polls). The others end JOIN_TAIL_US after their last slot. Radios take the period from
+     each POLL and find their polls by address, so cycles of two lengths are no trouble to them. */
+  const int join = ms_ticks - last_join_ms >= 20;
+  period_us = n * slot_us + (join || test_join_always ? 700u : JOIN_TAIL_US);
+  t_c += cycle_len;                                         /* the previous cycle's own length */
+  cycle_len = period_us;
   if ((int32_t)(us_now() - t_c) > (int32_t)period_us || (int32_t)(t_c - us_now()) > (int32_t)period_us)
     t_c = us_now();                                         /* fell behind / first run: restart the plan */
   wait_until(t_c);
@@ -744,7 +770,6 @@ void link_poll(void)
     ex_budget = (b + 1) * 50u;
     memset(ex_hist, 0, sizeof ex_hist); ex_hn = 0; ex_cycles = 0;
   }
-  const int join = ms_ticks - last_join_ms >= 20;
   /* A slot that missed its POLL is polled again in this cycle's spare time (cycles without a join
      window, while a whole slot still fits): its data waited a full cycle otherwise, and a weak link
      losing a few in a row piled those up. Off by default: with six devices only 106 of 1357 re-polls
@@ -798,6 +823,7 @@ int link_stream_pop(uint8_t *rep, int itf)
     slot_t *s = &sl[si];
     if (usb_packed) {
       if (!stream_pop_packed(rep, s, si)) continue;
+      if (s->imu_q_t) { lat_hist(h_usb, us_now() - s->imu_q_t); s->imu_q_t = 0; }
       rrs[itf] = (uint8_t)(si + 1);
       return 1;
     }
@@ -933,6 +959,22 @@ int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32.
     if (memcmp(name, pairs.name[in[2]], sizeof name)) { memcpy(pairs.name[in[2]], name, sizeof name); pairs_save(); }
     d[0] = in[2]; return 1;
   }
+  case 0x39: {                                              /* a slot's radio version: [slot][u32 LE] (the installer, */
+    uint32_t v;                                             /* after updating it: the device is off, it can't say) */
+    if (in[2] >= DML_SLOTS || !((pairs.used >> in[2]) & 1)) { *st = 2; return 1; }
+    memcpy(&v, in + 3, 4);
+    if (pairs.radio[in[2]] != v) { pairs.radio[in[2]] = v; pairs_dirty = 1; }
+    d[0] = in[2]; return 1;
+  }
+  case 0x3B:                                                /* test switches: [what][a][b] -> join_always, skip u16, drop % */
+    if (in[2] == 0) test_join_always = in[3] != 0;          /* 0: join window every cycle (a) */
+    else if (in[2] == 1) test_skip = (uint16_t)(in[3] | in[4] << 8);   /* 1: slots left out (mask a|b<<8) */
+    else if (in[2] == 2) test_drop_pct = in[3] > 100 ? 100 : in[3];    /* 2: answers dropped, % (a) */
+    d[0] = test_join_always; d[1] = (uint8_t)test_skip; d[2] = (uint8_t)(test_skip >> 8); d[3] = test_drop_pct;
+    return 1;
+  case 0x3A:                                                /* latency counters: dec[8] usb[8], u16 each */
+    memcpy(d, h_dec, 16); memcpy(d + 16, h_usb, 16); memset(h_dec, 0, 16); memset(h_usb, 0, 16);
+    return 1;
   case 0x38:                                                /* radio versions: -> [n][u32 LE per slot] (0 unknown) */
     d[0] = DML_SLOTS;
     for (int k = 0; k < DML_SLOTS; k++) put32(d + 1 + 4 * k, ((pairs.used >> k) & 1) ? pairs.radio[k] : 0);

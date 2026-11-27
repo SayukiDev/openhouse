@@ -484,11 +484,11 @@ void LighthouseDirect::FollowRotorWobble(uint32_t serial, double time, const std
   for (const int i : rows) (*z)[size_t(i)] -= wobble.value;
 }
 
-bool LighthouseDirect::OpticalUpdate(const OpticalFrame& frame, const BaseConfig& base, int slot) {
-  return ApplyOpticalResiduals(frame, base, slot);
+bool LighthouseDirect::OpticalUpdate(const OpticalFrame& frame, const BaseConfig& base, int slot, int* rejectedRows) {
+  return ApplyOpticalResiduals(frame, base, slot, rejectedRows);
 }
 
-bool LighthouseDirect::ApplyOpticalResiduals(const OpticalFrame& frame, const BaseConfig& base, int slot) {
+bool LighthouseDirect::ApplyOpticalResiduals(const OpticalFrame& frame, const BaseConfig& base, int slot, int* rejectedRows) {
   double time = std::numeric_limits<double>::infinity();
   for (const auto& s : frame.samples) time = std::min(time, s.time + 0.5 * s.width);
   auto samples = Gather(frame.samples);
@@ -570,9 +570,13 @@ bool LighthouseDirect::ApplyOpticalResiduals(const OpticalFrame& frame, const Ba
   // vrchat-01 unchanged: their accelerometers barely clip). 35 cm gained nothing more and
   // cost jumps; widening it by time refused instead (frames already metres off by then).
   filter_.frameRejectMove = swing_ && time - accelClippedAt_ < kClippedGateFor ? kClippedGateMove : DirectFilter::kFrameRejectMove;
+  const uint64_t gatedBefore = filter_.gatedRows;
   const bool ok = filter_.Update(residuals, R, Eigen::Map<Vec>(z.data(), m), true);
   filter_.frameGateOff = false;
-  if (!ok) return false;
+  if (!ok) {
+    if (rejectedRows) *rejectedRows = hits - int(filter_.gatedRows - gatedBefore);
+    return false;
+  }
   if (imuDisabled_) {
     // Without an accelerometer, damp linear acceleration state so alternating rotor sweeps
     // do not ring/overshoot between optical updates.
@@ -603,11 +607,16 @@ bool LighthouseDirect::ApplyOpticalResiduals(const OpticalFrame& frame, const Ba
 }
 
 bool LighthouseDirect::OnFrame(const OpticalFrame& frame) {
+  return OnFrame(frame, nullptr);
+}
+
+bool LighthouseDirect::OnFrame(const OpticalFrame& frame, RecoveryEvidence* recovery) {
+  if (recovery) *recovery = {};
   filter_.flags |= 8;
   const auto base = bases_.find(frame.baseSerial);
   if (base == bases_.end() || !frame.leftSyncIsReal || !frame.rightSyncIsReal) return false;
   const int slot = Slot(frame.baseSerial);
-  if (slot >= 0) return OpticalUpdate(frame, base->second.config, slot);
+  if (slot >= 0) return OpticalUpdate(frame, base->second.config, slot, recovery ? &recovery->rejectedRows : nullptr);
   if (frame.highFrameJitter) return false;
   return Bootstrap(frame, base->second.config);
 }

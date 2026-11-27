@@ -19,6 +19,8 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #else
+#include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>
 #endif
 
@@ -226,4 +228,64 @@ inline bool VrserverRunning() {
   return false;
 #endif
 }
+// The Watchman dongles' device-info requests (ff 83: a set, then gets) from two processes at
+// once wedge the dongles: SteamVR's watchdog (in Steam) and the driver starting in vrserver each
+// take this lock around them. Per user session. Held by this object until destroyed or Release().
+class DongleQueryLock {
+ public:
+  DongleQueryLock() = default;
+  DongleQueryLock(const DongleQueryLock&) = delete;
+  DongleQueryLock& operator=(const DongleQueryLock&) = delete;
+  ~DongleQueryLock() { Release(); }
+  // Waits up to `timeout`; false when the other side still holds it (it's then not taken).
+  bool Acquire(std::chrono::milliseconds timeout) {
+    Release();
+#ifdef _WIN32
+    handle_ = CreateMutexW(nullptr, FALSE, L"Local\\openhouse-dongle-query");
+    if (!handle_) return false;
+    const DWORD r = WaitForSingleObject(handle_, static_cast<DWORD>(timeout.count()));
+    if (r == WAIT_OBJECT_0 || r == WAIT_ABANDONED) { held_ = true; return true; }
+    CloseHandle(handle_);
+    handle_ = nullptr;
+    return false;
+#else
+    std::string dir = Env("XDG_RUNTIME_DIR");
+    if (dir.empty()) dir = "/tmp";
+    fd_ = ::open((dir + "/openhouse-dongle-query.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd_ < 0) return false;
+    const auto until = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+      if (flock(fd_, LOCK_EX | LOCK_NB) == 0) { held_ = true; return true; }
+      if (std::chrono::steady_clock::now() >= until) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ::close(fd_);
+    fd_ = -1;
+    return false;
+#endif
+  }
+  void Release() {
+#ifdef _WIN32
+    if (handle_) {
+      if (held_) ReleaseMutex(handle_);
+      CloseHandle(handle_);
+      handle_ = nullptr;
+    }
+#else
+    if (fd_ >= 0) {
+      ::close(fd_);   // drops the flock
+      fd_ = -1;
+    }
+#endif
+    held_ = false;
+  }
+
+ private:
+  bool held_ = false;
+#ifdef _WIN32
+  HANDLE handle_ = nullptr;
+#else
+  int fd_ = -1;
+#endif
+};
 }

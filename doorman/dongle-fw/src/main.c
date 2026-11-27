@@ -6,6 +6,7 @@
 #include "doorman_link.h"
 #include "link.h"
 #include "banks.h"
+#include "target.h"
 
 #ifndef VARIANT_SD
 #error "build with -DVARIANT_SD=0 or 1"
@@ -15,12 +16,19 @@
 #endif
 
 extern uint32_t __isr_vector[];
-#if BOARD_NORDIC_DFU
+#if BOARD_IDX
+/* The Index radio module's LED pin (if any) is not known: never drive a pin we don't own. */
+#define LED_INIT() do {} while (0)
+#define LED_ON()   do {} while (0)
+#define LED_OFF()  do {} while (0)
+#elif BOARD_NORDIC_DFU
 #define LED_PIN 6    /* P0.06: green LED, active low (Holyiot 21017 and PCA10059 alike) */
+#define LED_INIT() (NRF_P0->PIN_CNF[LED_PIN] = 1)
 #define LED_ON()  (NRF_P0->OUTCLR = 1u << LED_PIN)
 #define LED_OFF() (NRF_P0->OUTSET = 1u << LED_PIN)
 #else
 #define LED_PIN 15   /* P0.15: Pro Micro / nice!nano LED, active high */
+#define LED_INIT() (NRF_P0->PIN_CNF[LED_PIN] = 1)
 #define LED_ON()  (NRF_P0->OUTSET = 1u << LED_PIN)
 #define LED_OFF() (NRF_P0->OUTCLR = 1u << LED_PIN)
 #endif
@@ -30,7 +38,7 @@ typedef struct {
     uint32_t magic, type, pc, lr, psr, cfsr, hfsr, bfar, count, sum;
 } crash_rec_t;
 #define CRASH_MAGIC 0x43525348u   /* "CRSH" */
-#define crash ((volatile crash_rec_t *)0x2003E000)
+#define crash ((volatile crash_rec_t *)CRASH_ADDR)
 #define QUICK_CRASH_LIMIT 3       /* this many crashes in a row (each < 10 s uptime) -> UF2 bootloader */
 
 static uint32_t crash_sum(void) {
@@ -111,6 +119,11 @@ static uint8_t reply[64], pending_reply, pending_action, pending_scan, scan_firs
 static void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 
 /* Self-update (banks.h): this image runs in one bank, updates go into the other. */
+#if BOARD_IDX
+/* No bank layout on the Index radio: one image at 0x26000, updated through the bootloader's
+   serial DFU.  Keep the bank commands out of the protocol so a host can't poke bank addresses. */
+static uint32_t running_bank(void) { return 0; }
+#else
 static uint32_t upd_size, upd_crc;
 static uint8_t upd_open;
 static uint32_t running_bank(void) { return (uint32_t)__isr_vector - BANK_IMAGE_OFS; }
@@ -134,6 +147,7 @@ static void nvmc_write(uint32_t addr, const uint8_t *src, uint32_t n)
     }
     NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Ren; nvmc_ready();
 }
+#endif
 
 static void handle(const uint8_t *in, uint16_t len) {
     usb_rx++;
@@ -158,10 +172,11 @@ static void handle(const uint8_t *in, uint16_t len) {
         put32(d + 53, *(volatile uint32_t *)0x3000 == 0x51B1E5DB);   /* SoftDevice magic still in flash? */
         d[57] = BOARD_ID;    /* 0 UF2 (Pro Micro style), 1 Holyiot 21017, 2 PCA10059, 3 Kuroshin (Nordic DFU) */
         d[58] = safe_mode;
-        d[59] = running_bank() == BANK_A ? 1 : 2;   /* which bank runs (banks.h) */
+        d[59] = BOARD_IDX ? 0 : (running_bank() == BANK_A ? 1 : 2);   /* which bank runs (banks.h) */
         d[60] = DML_SLOTS;   /* slots it has (0 from firmware before 0x002A: 8) */
         break;
     case CMD_STATS: put32(d, usb_rx); put32(d + 4, usb_tx); put32(d + 8, ms_ticks); break;
+#if !BOARD_IDX
     case CMD_BANK_BEGIN: {
         uint32_t size, crc; memcpy(&size, in + 2, 4); memcpy(&crc, in + 6, 4);
         if (!size || size > BANK_IMAGE_MAX || (size & 3)) { st = ST_BAD_ARG; break; }
@@ -192,11 +207,12 @@ static void handle(const uint8_t *in, uint16_t len) {
         put32(d, h.seq);
         break;
     }
+#endif /* !BOARD_IDX */
     case 0x7D: {                                /* read memory: [addr u32][n <= 56]; flash, UICR, FICR, RAM */
         uint32_t a; memcpy(&a, in + 2, 4);
         uint8_t n = in[6] > 56 ? 56 : in[6];
-        const int ok = (a < 0x100000u && a + n <= 0x100000u) || (a >= 0x10000000u && a + n <= 0x10002000u) ||
-                       (a >= 0x20000000u && a + n <= 0x20040000u);
+        const int ok = (a < CHIP_FLASH_END && a + n <= CHIP_FLASH_END) || (a >= 0x10000000u && a + n <= 0x10002000u) ||
+                       (a >= RAM_BASE && a + n <= CHIP_RAM_END);
         if (!ok) { st = ST_BAD_ARG; break; }
         put32(d, a); d[4] = n; memcpy(d + 5, (const void *)a, n);
         break;
@@ -295,7 +311,7 @@ int main(void) {
     }
 #endif
     __enable_irq();                         /* don't rely on the bootloader leaving PRIMASK clear */
-    NRF_P0->PIN_CNF[LED_PIN] = 1; LED_ON();   /* LED on: main() reached */
+    LED_INIT(); LED_ON();                   /* LED on: main() reached */
     boot_resetreas = NRF_POWER->RESETREAS;
     NRF_POWER->RESETREAS = 0xFFFFFFFF;
     if (boot_resetreas & (POWER_RESETREAS_RESETPIN_Msk) || boot_resetreas == 0) NRF_POWER->GPREGRET2 = 0;
@@ -307,7 +323,7 @@ int main(void) {
     hb_ms = 0;
     SysTick_Config(SystemCoreClock / 1000);
     NVIC_SetPriority(SysTick_IRQn, 0);      /* above USB and everything else: the hang detector */
-    NRF_P0->PIN_CNF[LED_PIN] = 1;           /* output */
+    LED_INIT();                             /* output */
     NVIC_SetPriority(USBD_IRQn, 2);
     NVIC_SetPriority(POWER_CLOCK_IRQn, 2);
 

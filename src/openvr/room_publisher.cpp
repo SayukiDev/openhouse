@@ -140,11 +140,13 @@ void RoomPublisher::Publish(const SessionSnapshot& snapshot, const Eigen::Isomet
     bases.push_back({b.serial, b.seen, b.known, rawFromWorld * worldFromBase,
                      b.sigma, b.locked, b.learned});
   }
-  const bool settled = settle_.Update(bases, now);
+  // Not settled until its level is (RoomMap::LevelSettled): SteamVR's frame is levelled to it then
+  // (RawAlignment), so a tool that aligns once the room is settled never sees it tilt afterwards.
+  const bool settled = settle_.Update(bases, now) && snapshot.levelSettled;
   settled_ = settled;
   {
     // Logged on a change only: settled or not, and which bases hold it back.
-    std::string key = settled ? "settled" : "settling";
+    std::string key = settled ? "settled" : snapshot.levelSettled ? "settling" : "levelling";
     std::string text = std::string("room ") + (settled ? "settled" : "not settled");
     std::string ok, waiting;
     for (const auto& b : bases) {
@@ -161,6 +163,7 @@ void RoomPublisher::Publish(const SessionSnapshot& snapshot, const Eigen::Isomet
       lastLogKey_ = key;
       text += ": placed" + (ok.empty() ? std::string(" none") : ok);
       if (!waiting.empty()) text += "; waiting for" + waiting;
+      if (!snapshot.levelSettled) text += "; waiting for its level";
       char e[48];
       std::snprintf(e, sizeof e, " (epoch %llu)", static_cast<unsigned long long>(settle_.epoch()));
       pendingLog_ = text + e;

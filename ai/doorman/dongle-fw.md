@@ -5,6 +5,11 @@ nRF52840 Dongle (PCA10059 or compatible), tinyusb, polled main loop (no radio in
 joining/pairing, hopping, go-back-N, codec), `src/usb_descriptors.c`, `src/dongle.h` (`DONGLE_FW_VERSION`,
 VID/PID 6767:0727, command numbers).
 
+From `doorman/dongle-fw`, run `make check-nrf52833` to compile both banks and link and convert the
+install image for a 512 KiB flash / 128 KiB RAM target. This is a build check only. It uses the
+`833_uf2` layout (MBR, application at 0x1000, no SoftDevice) and has no receiver-specific pin map or
+board ID. Use a board-specific build for flashing. The default `make` still builds the shipping boards.
+
 ## Two builds (same code, different flash base)
 
 | UF2 | For | App base | RAM |

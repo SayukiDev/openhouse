@@ -1,9 +1,13 @@
 #include "driver_install.hpp"
 #include "shortcuts.hpp"
+#include "lh/udev_rules.h"
+#include "lh/version.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdlib>
+#include <fstream>
 #include <stdexcept>
 #include <vector>
 
@@ -168,6 +172,37 @@ fs::path MonadoUnit() {
   return (xdg && *xdg ? Path(xdg) : HomeDirectory() / ".config") / "systemd" / "user" / "openhouse-update-checker.service";
 }
 
+fs::path EnvisionConfig() {
+  const char* xdg = std::getenv("XDG_CONFIG_HOME");
+  return (xdg && *xdg ? Path(xdg) : HomeDirectory() / ".config") / "envision" / "envision.json";
+}
+
+// Envision runs only the plugins ticked in its Preferences: their .desktop paths (canonical, as it
+// compares them) in its config's xr_plugins. Envision writes its whole config back from memory, so
+// it's only edited while Envision isn't running. False when it is, or there's no config to edit.
+bool EnableEnvisionPlugin(const fs::path& desktop, bool on) {
+  const fs::path config = EnvisionConfig();
+  std::error_code ec;
+  if (!fs::exists(config, ec) || RunProcess({"pgrep", "-x", "envision"}, nullptr) == 0) return false;
+  nlohmann::json j;
+  try {
+    std::ifstream in(config);
+    j = nlohmann::json::parse(in);
+  } catch (const std::exception&) {
+    return false;
+  }
+  if (!j.is_object()) return false;
+  const std::string path = Utf8(fs::weakly_canonical(desktop, ec));
+  nlohmann::json plugins = nlohmann::json::array();
+  if (j.contains("xr_plugins") && j["xr_plugins"].is_array())
+    for (const auto& e : j["xr_plugins"])
+      if (!(e.is_string() && e.get<std::string>() == path)) plugins.push_back(e);
+  if (on) plugins.push_back(path);
+  if (j.contains("xr_plugins") && j["xr_plugins"] == plugins) return true;
+  j["xr_plugins"] = plugins;
+  return WriteFileAtomic(config, j.dump(2) + "\n");
+}
+
 // For Monado / WiVRn (they don't start SteamVR apps): a systemd user service that runs the
 // update check (openhouse-overlay --check) whenever monado-service or wivrn-server starts.
 void InstallMonadoCheck(const Paths& p) {
@@ -320,19 +355,7 @@ bool PackageHasDriver() {
 #ifndef _WIN32
 namespace {
 constexpr const char* kUdevPath = "/etc/udev/rules.d/60-openhouse.rules";
-constexpr const char* kUdevRules =
-    "# openhouse: lets the logged-in user's openhouse driver, installer and tools open these devices.\n"
-    "# Valve lighthouse devices: Watchman dongles, trackers, controllers, headsets (hidraw, and USB for\n"
-    "# SteamVR's firmware updater).\n"
-    "KERNEL==\"hidraw*\", ATTRS{idVendor}==\"28de\", MODE=\"0660\", TAG+=\"uaccess\"\n"
-    "SUBSYSTEM==\"usb\", ATTRS{idVendor}==\"28de\", MODE=\"0660\", TAG+=\"uaccess\"\n"
-    "# HTC parts of VIVE headsets.\n"
-    "KERNEL==\"hidraw*\", ATTRS{idVendor}==\"0bb4\", MODE=\"0660\", TAG+=\"uaccess\"\n"
-    "# Doorman Dongle.\n"
-    "KERNEL==\"hidraw*\", ATTRS{idVendor}==\"6767\", ATTRS{idProduct}==\"0727\", MODE=\"0660\", TAG+=\"uaccess\"\n"
-    "SUBSYSTEM==\"usb\", ATTRS{idVendor}==\"6767\", ATTRS{idProduct}==\"0727\", MODE=\"0660\", TAG+=\"uaccess\"\n"
-    "# Nordic's USB DFU bootloader (Holyiot, PCA10059): its serial port, kept away from ModemManager.\n"
-    "SUBSYSTEM==\"tty\", ATTRS{idVendor}==\"1915\", ATTRS{idProduct}==\"521f\", MODE=\"0660\", TAG+=\"uaccess\", ENV{ID_MM_DEVICE_IGNORE}=\"1\"\n";
+// kUdevRules: cmake/linux/60-openhouse.rules (generated/lh/udev_rules.h), what the Nix package installs too.
 
 // One root shell command through pkexec (the desktop's password prompt).
 bool AsRoot(const std::string& script, const std::vector<std::string>& args, std::string* error) {
@@ -351,11 +374,19 @@ bool AsRoot(const std::string& script, const std::vector<std::string>& args, std
 }  // namespace
 #endif
 
+// NixOS: /etc is read-only and built from the configuration; the rule comes from openhouse's NixOS
+// module (programs.openhouse.enable, flake.nix), never from here.
+bool NixOS() {
+  std::error_code ec;
+  return fs::exists("/etc/NIXOS", ec);
+}
+
 bool DeviceAccessInstalled() {
 #ifdef _WIN32
   return true;
 #else
   std::string text;
+  if (NixOS()) return ReadFile(kUdevPath, &text);   // the module's, whichever openhouse version it's from
   return ReadFile(kUdevPath, &text) && text == kUdevRules;
 #endif
 }
@@ -365,6 +396,10 @@ bool InstallDeviceAccess(std::string* error) {
   (void)error;
   return true;
 #else
+  if (NixOS()) {
+    *error = "On NixOS, add openhouse's NixOS module to your configuration (programs.openhouse.enable = true) and rebuild";
+    return false;
+  }
   const fs::path temp = DataDirectory() / "60-openhouse.rules";
   if (!WriteFileAtomic(temp, kUdevRules)) { *error = "couldn't write " + Utf8(temp); return false; }
   const bool ok = AsRoot(std::string("install -m 0644 \"$1\" ") + kUdevPath +
@@ -381,17 +416,19 @@ bool RemoveDeviceAccess(std::string* error) {
   return true;
 #else
   std::error_code ec;
-  if (!fs::exists(kUdevPath, ec)) return true;
+  if (NixOS() || !fs::exists(kUdevPath, ec)) return true;   // NixOS: the module's, removed with it
   return AsRoot(std::string("rm -f ") + kUdevPath + " && udevadm control --reload-rules", {}, error);
 #endif
 }
 
-bool MonadoCheckInstalled() {
+MonadoCheck InstalledMonadoCheck() {
 #ifdef _WIN32
-  return false;
+  return MonadoCheck::None;
 #else
   std::error_code ec;
-  return fs::exists(MonadoUnit(), ec);
+  if (fs::exists(MonadoUnit(), ec)) return MonadoCheck::Systemd;
+  if (fs::exists(ShortcutFile("update-check"), ec)) return MonadoCheck::Envision;
+  return fs::is_directory(EnvisionConfig().parent_path(), ec) ? MonadoCheck::Envision : MonadoCheck::Systemd;
 #endif
 }
 
@@ -498,8 +535,15 @@ void InstallDriver(const fs::path& steamvr, const InstallOptions& options, const
   if (fs::exists(p.data / overlay.filename(), ec)) {
     Shortcut s{"openhouse", "openhouse", "Devices, base stations, room and settings", p.data / overlay.filename(), icon("openhouse.png"), {}};
 #ifndef _WIN32
-    // Envision runs it as a plugin; the systemd check does the same job when it's on.
-    if (!options.monadoCheck) s.xrPluginArgs = {"--check", Utf8(p.directory)};
+    // Envision: the openhouse window as a plugin to opt into (it opens with each session), and the
+    // update check as its own, hidden from the menu.
+    if (options.monadoCheck == MonadoCheck::Envision) {
+      s.xrPlugin = true;
+      Shortcut check{"update-check", "openhouse update check", "Warns when a SteamVR update replaced the openhouse driver",
+                     p.data / overlay.filename(), s.icon, {"--check", Utf8(p.directory)}};
+      check.hidden = true;
+      shortcuts.push_back(check);
+    }
 #endif
     shortcuts.push_back(s);
   }
@@ -511,14 +555,44 @@ void InstallDriver(const fs::path& steamvr, const InstallOptions& options, const
     }
     if (fs::exists(p.data / m.filename(), ec)) shortcuts.push_back({"doorman-dongle-manager", "Doorman Dongle Manager", "Doorman Dongle pairing, channels and firmware", p.data / m.filename(), icon("dongle-manager.png"), {}});
   }
+  // The installer this install came from (the saved package's): to reinstall, repair, uninstall or
+  // flash firmware later without finding the extracted package again.
+  if (const fs::path installer = saved / (std::string("openhouse-installer") + kExe); fs::exists(installer, ec))
+    shortcuts.push_back({"installer", std::string("openhouse installer (v") + lh::kVersion + ")",
+                         "Installs, repairs or removes openhouse, and flashes its firmware", installer, icon("openhouse.png"), {}});
+  // Run from the Nix store (the flake's package): its own menu entries are already there (openhouse,
+  // the dongle manager, the installer), so only the hidden Envision update check is written here.
+  if (Utf8(here).rfind("/nix/store/", 0) == 0)
+    shortcuts.erase(std::remove_if(shortcuts.begin(), shortcuts.end(), [](const Shortcut& s) { return !s.hidden; }), shortcuts.end());
+#ifndef _WIN32
+  // Before 1.0.5 the update check was the "openhouse" entry's own Envision plugin (--check). That
+  // entry now opens the openhouse window: if Envision had it ticked for the check, it's unticked,
+  // so the window doesn't start opening with every session (the check has its own entry now).
+  {
+    std::ifstream old(ShortcutFile("openhouse"));
+    const std::string text((std::istreambuf_iterator<char>(old)), std::istreambuf_iterator<char>());
+    const auto plugin = text.find("X-XR-Plugin-Exec=");
+    if (plugin != std::string::npos && text.find("--check", plugin) < text.find('\n', plugin))
+      EnableEnvisionPlugin(ShortcutFile("openhouse"), false);
+  }
+#endif
+  // SteamVR's firmware Update button on a device opens openhouse://update-dongles: the saved installer.
+  if (!InstallUrlHandler(saved / (std::string("openhouse-installer") + kExe))) log("SteamVR's Update button won't open the updater");
   if (const std::string failed = InstallShortcuts(shortcuts); !failed.empty()) log("Menu entries not added: " + failed);
   else if (!shortcuts.empty()) log("Added the apps to the menu");
 #ifndef _WIN32
-  if (options.monadoCheck) {
+  if (options.monadoCheck == MonadoCheck::Systemd) {
     InstallMonadoCheck(p);
     log("Installed the update check for Monado / WiVRn");
   } else {
     RemoveMonadoCheck();
+  }
+  const fs::path checkPlugin = ShortcutFile("update-check");
+  if (options.monadoCheck == MonadoCheck::Envision) {
+    if (EnableEnvisionPlugin(checkPlugin, true)) log("Added the update check to Envision's plugins");
+    else log("Enable \"openhouse update check\" in Envision's Preferences (Envision is open, or not set up yet)");
+  } else {
+    EnableEnvisionPlugin(checkPlugin, false);
   }
 #else
   (void)options;
@@ -558,7 +632,11 @@ void UninstallDriver(const fs::path& steamvr, const std::function<void(const std
 #ifndef _WIN32
   RemoveMonadoCheck();
 #endif
+#ifndef _WIN32
+  Try(log, "Envision plugin not removed", [&] { EnableEnvisionPlugin(ShortcutFile("update-check"), false); });
+#endif
   Try(log, "Menu entries not removed", [&] { RemoveShortcuts(); });
+  Try(log, "Link handler not removed", [&] { RemoveUrlHandler(); });
   // Only the files the installer put there: the folder also holds the user's recordings.
   for (const char* name : {"update-checker", "update-checker.exe", "update-checker.vrmanifest", "openhouse-installer", "openhouse-installer.exe", "openhouse-overlay",
                            "openhouse-overlay.exe", "openhouse-overlay.vrmanifest", "openhouse-monado-watch", "doorman-dongle-manager",

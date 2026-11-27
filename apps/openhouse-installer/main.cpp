@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#include <iterator>
 #include <vector>
 
 #include "common/crash_log.hpp"
@@ -95,10 +96,13 @@ int Run(const std::string& mode) {
       glfwSwapBuffers(window);
     }
   }
-  // Scans finish on their own threads: let the last one end before the process does (bounded).
+  // Gone from the screen at once: what's left below can take a moment (on Windows a USB call can).
+  glfwHideWindow(window);
+  // Scans finish on their own threads: let the last one end before the process does (bounded: a scan
+  // checks g_closing between requests, so it stops within one).
   openhouse::installer::g_closing = true;
   std::unique_lock devices(openhouse::installer::g_deviceMutex, std::defer_lock);
-  for (int i = 0; i < 100 && !devices.try_lock(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  for (int i = 0; i < 30 && !devices.try_lock(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
   ImGui_ImplOpenGL2_Shutdown();
   ImGui_ImplGlfw_Shutdown();
   ImGui::DestroyContext();
@@ -112,7 +116,25 @@ int Run(const std::string& mode) {
 // installer; --install (that installer) and --repair (the overlay's Fix, from the package kept at
 // install): install right away; --uninstall (its Uninstall openhouse): uninstall right away;
 // --dongles (the overlay's firmware warning): the dongle update, closing SteamVR / Monado for it.
+// --url LINK: an openhouse:// link (SteamVR's firmware Update button on a device): the dongle update.
 int main(int argc, char** argv) {
   lh::crash::Install("openhouse-installer");
-  return Run(argc > 1 ? argv[1] : "");
+  std::string mode = argc > 1 ? argv[1] : "";
+  if (mode == "--url") {
+#ifdef _WIN32
+    // Started by SteamVR: out of its job first, or closing SteamVR for the update closes this too.
+    wchar_t self[MAX_PATH * 2]{};
+    GetModuleFileNameW(nullptr, self, DWORD(std::size(self)));
+    std::wstring command = L"\"" + std::wstring(self) + L"\" --dongles";
+    STARTUPINFOW si{sizeof si};
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_BREAKAWAY_FROM_JOB, nullptr, nullptr, &si, &pi)) {
+      CloseHandle(pi.hThread);
+      CloseHandle(pi.hProcess);
+      return 0;
+    }
+#endif
+    mode = "--dongles";   // not in a job (or no breakaway allowed): run here
+  }
+  return Run(mode);
 }

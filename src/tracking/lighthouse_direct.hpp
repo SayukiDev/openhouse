@@ -81,7 +81,11 @@ class LighthouseDirect {
   void OnBaseConfig(const BaseConfig&, const BaseDynamicState&);
   void SetRecordedTilt(uint32_t serial, std::array<double, 2> tilt, double variance);
   void OnImu(const ImuSample&);
+  struct RecoveryEvidence {
+    int rejectedRows = 0;
+  };
   bool OnFrame(const OpticalFrame&);
+  bool OnFrame(const OpticalFrame&, RecoveryEvidence*);
   // Consume inertial data while optical data is unavailable. This is an explicit
   // fallback policy, not the original CImuOnlyTracker implementation.
   bool AdvanceInertial(double time);
@@ -166,8 +170,8 @@ class LighthouseDirect {
  private:
   bool Bootstrap(const OpticalFrame&, const BaseConfig&);
   bool CanSwitchPrimary(uint32_t serial) const;
-  bool ApplyOpticalResiduals(const OpticalFrame&, const BaseConfig&, int slot);
-  bool OpticalUpdate(const OpticalFrame&, const BaseConfig&, int slot);
+  bool ApplyOpticalResiduals(const OpticalFrame&, const BaseConfig&, int slot, int* rejectedRows);
+  bool OpticalUpdate(const OpticalFrame&, const BaseConfig&, int slot, int* rejectedRows);
   bool ImuUpdate(const ImuSample&);
   bool PredictTo(double time);
   int Slot(uint32_t serial) const;

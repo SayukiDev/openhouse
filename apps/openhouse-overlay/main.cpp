@@ -40,6 +40,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <timeapi.h>
 #endif
 
 namespace {
@@ -223,6 +224,16 @@ int RunOverlay() {
   ImGuiIO& io = ImGui::GetIO();
   io.DisplaySize = ImVec2(float(kTextureWidth), float(kTextureHeight));
   io.BackendPlatformName = "openhouse-openvr";
+  // Each frame takes all its input at once (the latest position, the summed scroll). Trickled, ImGui took
+  // one change of input kind a frame: the laser's move and a thumb resting on the trackpad (a scroll every
+  // frame) arrived faster than that, and the cursor fell seconds behind. A click inside one frame is kept
+  // below by handing its release over the frame after.
+  io.ConfigInputTrickleEventQueue = false;
+#ifdef _WIN32
+  timeBeginPeriod(1);   // sleep_for(16 ms) slept two 15.6 ms timer ticks: ~32 frames a second, not ~60
+#endif
+  std::array<bool, 3> pressedThisFrame{};
+  std::vector<int> releaseNextFrame;
   ImGui_ImplOpenGL2_Init();
   Ui ui(TelemetryPort());
   ui.SetInVR(true);
@@ -267,6 +278,9 @@ int RunOverlay() {
     // behind. Clicks keep their place: the position is handed over before each.
     std::optional<ImVec2> pointer;
     float wheelX = 0, wheelY = 0;
+    for (int b : releaseNextFrame) io.AddMouseButtonEvent(b, false);   // pressed and released last frame
+    releaseNextFrame.clear();
+    pressedThisFrame.fill(false);
     const auto flushPointer = [&] { if (pointer) io.AddMousePosEvent(pointer->x, pointer->y); pointer.reset(); };
     while (overlay->PollNextOverlayEvent(main, &event, sizeof event)) {
       switch (event.eventType) {
@@ -276,7 +290,10 @@ int RunOverlay() {
           const int button = event.data.mouse.button == vr::VRMouseButton_Right ? 1 : event.data.mouse.button == vr::VRMouseButton_Middle ? 2 : 0;
           pointer = ImVec2(event.data.mouse.x, MouseY(event.data.mouse.y));
           flushPointer();
-          io.AddMouseButtonEvent(button, event.eventType == vr::VREvent_MouseButtonDown);
+          const bool down = event.eventType == vr::VREvent_MouseButtonDown;
+          if (!down && pressedThisFrame[size_t(button)]) releaseNextFrame.push_back(button);
+          else io.AddMouseButtonEvent(button, down);
+          if (down) pressedThisFrame[size_t(button)] = true;
           break;
         }
         case vr::VREvent_KeyboardDone: {

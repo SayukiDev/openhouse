@@ -31,13 +31,21 @@ struct DriverStatus {
 };
 DriverStatus ReadStatus(const fs::path& steamvr);
 
+// Linux: how the update check runs under Monado / WiVRn (they don't start SteamVR's apps).
+enum class MonadoCheck {
+  None,
+  Envision,  // Envision plugins (.desktop X-XR-Plugin): the check, and the openhouse window to opt into
+  Systemd,   // a systemd user service watching for monado-service / wivrn-server
+};
 struct InstallOptions {
-  bool monadoCheck = false;  // Linux: the update check for Monado / WiVRn too (systemd user service)
+  MonadoCheck monadoCheck = MonadoCheck::None;
 };
 // Both throw std::runtime_error with a message for the user; `log` gets each step.
 void InstallDriver(const fs::path& steamvr, const InstallOptions& options, const std::function<void(const std::string&)>& log);
 void UninstallDriver(const fs::path& steamvr, const std::function<void(const std::string&)>& log);
-bool MonadoCheckInstalled();
+// What the last install set up (the default for the next one, so a repair keeps it); with
+// none, Envision when it's installed (its config folder), otherwise systemd.
+MonadoCheck InstalledMonadoCheck();
 
 // Linux: the udev rule that lets the logged-in user open Valve/HTC lighthouse devices and the
 // Doorman Dongle (/etc/udev/rules.d/60-openhouse.rules). Installing or removing it asks for the

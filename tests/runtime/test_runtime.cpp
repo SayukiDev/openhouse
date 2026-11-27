@@ -547,6 +547,49 @@ TEST(RoomMap, LevelAndSolverCorrectionsAreNeverSteps) {
   EXPECT_NEAR((room.Base(2)->worldFromBase.translation() - placed.translation()).norm(), 0.03, 1e-3);  // the solve, weighed against what the room knew
 }
 
+// What SteamVR's frame is levelled to (RawAlignment): a fresh origin's base accelerometer isn't
+// settled; a level is once no new one has come for 60 s and it has glided in; a stored room's
+// origin (small variance, no level this session) is settled at once.
+TEST(RoomMap, LevelSettlesOnceItStopsChanging) {
+  RoomMap room;
+  room.OnBaseSeen(Config(1), {});
+  ASSERT_TRUE(room.EstablishOrigin(1, {0.0, 0.0}, 1.5e-4));  // its accelerometer only
+  double t = 100;
+  room.Advance(t);
+  EXPECT_FALSE(room.LevelSettled());
+  for (; t < 103; t += 0.01) { room.Advance(t); room.RefineOriginTilt(1, {0.03, 0}, 1e-6, t); }
+  EXPECT_FALSE(room.LevelSettled()) << "levelled, but only just";
+  for (; t < 160; t += 0.01) room.Advance(t);
+  EXPECT_FALSE(room.LevelSettled()) << "57 s after the level";
+  for (; t < 164; t += 0.01) room.Advance(t);
+  EXPECT_TRUE(room.LevelSettled());
+  // a better estimate starts the wait again
+  room.RefineOriginTilt(1, {0.04, 0}, 1e-7, t);
+  EXPECT_FALSE(room.LevelSettled());
+
+  RoomMap stored;
+  stored.OnBaseSeen(Config(1), {});
+  ASSERT_TRUE(stored.EstablishOrigin(1, {0.0, 0.0}, 3e-7));   // as a saved room's origin
+  EXPECT_TRUE(stored.LevelSettled());
+
+  // A room from SteamVR's database: its heading, origin and floor, but its level is the stock
+  // driver's, so the devices level it before it is settled, as a new room.
+  RoomMap imported;
+  ASSERT_TRUE(imported.ImportSteamDatabase(R"({"known_universes": [{"id": "77", "tilt": {"pitch": 0.035, "roll": 0.0},
+      "base_stations": [{"base_serial_number": 1, "target_pose": {"pose": [0, 0, 0, 1, 0, 0, 0], "variance": 0}}]}]})"));
+  imported.OnBaseSeen(Config(1), {});
+  ASSERT_NE(imported.Active(), nullptr);
+  ASSERT_EQ(imported.Active()->id, "steamvr-77");
+  EXPECT_DOUBLE_EQ(imported.Base(1)->rotationVariance, RoomMap::kImportedLevelVariance);
+  t = 100;
+  imported.Advance(t);
+  EXPECT_FALSE(imported.LevelSettled());
+  for (; t < 103; t += 0.01) { imported.Advance(t); imported.RefineOriginTilt(1, {0.0, 0}, 1e-6, t); }
+  EXPECT_GT(Eigen::AngleAxisd(imported.Base(1)->worldFromBase.rotation()).angle(), 0.0) << "levelled by the devices";
+  for (; t < 164; t += 0.01) imported.Advance(t);
+  EXPECT_TRUE(imported.LevelSettled());
+}
+
 TEST(RoomMap, LearnsRefinesAndRelearnsBases) {
   RoomMap room;
   room.OnBaseSeen(Config(1), {});
@@ -850,11 +893,9 @@ TEST(DeviceRecovery, OcclusionCoastsForTheStockTimeoutAndKeepsCalibration) {
   EXPECT_TRUE(epoch);
 }
 
-// Switching LH1 -> LH2 mode, the last sorted frames reached the filter 0.17-0.31 s late, behind the
-// time the IMU had carried it to, and the LH2 light only came 0.5-1.5 s after the switch. Light the
-// filter skips for being late isn't light that doesn't fit: it used to restart tracking 0.45 s in
-// (live: 12 of 45 such switches). Light that comes in time and is refused still does.
-TEST(DeviceRecovery, LateLightIsNotRefusedLight) {
+// A sweep can arrive too late or provide no usable measurements after sensor filtering.
+// Only a well-lit update that the pose filter actually rejects should trigger early recovery.
+TEST(DeviceRecovery, SkippedLightIsNotRefusedLight) {
   TrackedObjectModel model;
   model.points = {{{-0.08, -0.07, -0.02}}, {{0.08, -0.07, 0.02}}, {{-0.08, 0.07, 0.03}},
                   {{0.08, 0.07, -0.03}}, {{0, 0, 0.08}}, {{0.04, 0.01, -0.06}}};
@@ -884,8 +925,54 @@ TEST(DeviceRecovery, LateLightIsNotRefusedLight) {
   DeviceTrackerTestAccess::Check(tracker, 10.6);
   EXPECT_TRUE(DeviceTrackerTestAccess::Core(tracker).Bootstrapped());
   EXPECT_FALSE(restarted());
-  for (int i = 0; i < 12; ++i) DeviceTrackerTestAccess::Frame(tracker, frame(10.62 + 0.008 * i, i & 1));  // in time
+  for (int i = 0; i < 12; ++i) {
+    auto duplicateHits = frame(10.62 + 0.008 * i, i & 1);
+    const auto hits = duplicateHits.samples;
+    duplicateHits.samples.insert(duplicateHits.samples.end(), hits.begin(), hits.end());
+    DeviceTrackerTestAccess::Frame(tracker, duplicateHits);
+  }
   DeviceTrackerTestAccess::Check(tracker, 10.8);
+  ASSERT_TRUE(DeviceTrackerTestAccess::Core(tracker).Bootstrapped());
+  EXPECT_FALSE(restarted());
+  for (int i = 0; i < 7; ++i) DeviceTrackerTestAccess::Frame(tracker, frame(10.82 + 0.008 * i, i & 1));
+  auto unsynced = frame(10.89, 1);
+  unsynced.rightSyncIsReal = false;
+  DeviceTrackerTestAccess::Frame(tracker, unsynced);
+  DeviceTrackerTestAccess::Check(tracker, 10.9);
+  ASSERT_TRUE(DeviceTrackerTestAccess::Core(tracker).Bootstrapped());
+  EXPECT_FALSE(restarted());
+
+  auto matchingFrame = [&](double time) {
+    auto good = frame(time, 0);
+    for (auto& sample : good.samples) {
+      const auto& p = model.points[sample.sensor];
+      sample.angle = lh::model::Lh1Angle(0, p[0], p[1], p[2] - 2, base.cal.data());
+    }
+    return good;
+  };
+  DeviceTrackerTestAccess::Frame(tracker, matchingFrame(10.95));
+  const double fix = DeviceTrackerTestAccess::Core(tracker).LastOpticalTime();
+  ASSERT_GT(fix, seed.time);
+  for (int i = 0; i < 7; ++i) DeviceTrackerTestAccess::Frame(tracker, frame(10.97 + 0.008 * i, i & 1));
+  auto weak = matchingFrame(11.04);
+  weak.samples.resize(1);
+  DeviceTrackerTestAccess::Frame(tracker, weak);
+  EXPECT_DOUBLE_EQ(DeviceTrackerTestAccess::Core(tracker).LastOpticalTime(), fix);
+  DeviceTrackerTestAccess::Check(tracker, fix + 0.51);
+  ASSERT_TRUE(DeviceTrackerTestAccess::Core(tracker).Bootstrapped());
+  EXPECT_FALSE(restarted());
+  DeviceTrackerTestAccess::Frame(tracker, frame(fix + 0.52, 0));
+  DeviceTrackerTestAccess::Check(tracker, fix + 0.53);
+  ASSERT_FALSE(DeviceTrackerTestAccess::Core(tracker).Bootstrapped());
+  EXPECT_TRUE(restarted());
+
+  seed.time = 12.0;
+  ASSERT_TRUE(DeviceTrackerTestAccess::Core(tracker).SeedPose(seed));
+  for (int i = 0; i < 8; ++i) DeviceTrackerTestAccess::Frame(tracker, frame(12.01 + 0.008 * i, i & 1));
+  DeviceTrackerTestAccess::Check(tracker, 12.5);
+  ASSERT_TRUE(DeviceTrackerTestAccess::Core(tracker).Bootstrapped());
+  EXPECT_FALSE(restarted());
+  DeviceTrackerTestAccess::Check(tracker, 12.51);
   EXPECT_FALSE(DeviceTrackerTestAccess::Core(tracker).Bootstrapped());
   EXPECT_TRUE(restarted());
 }

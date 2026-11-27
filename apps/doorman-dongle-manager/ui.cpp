@@ -871,7 +871,7 @@ void Ui::Firmware(const DongleState& d) {
     char t[96];
     row("Dongle", d.serial);
     std::snprintf(t, sizeof t, "%d (%s build%s)", d.firmware,
-                  d.board == 1 ? "Holyiot 21017" : d.board == 2 ? "PCA10059" : d.board == 3 ? (d.bank == 2 ? "Kuroshin, bank B" : "Kuroshin, bank A") : d.softdeviceVariant ? "Nordic bootloader" : "bare",
+                  d.board == 4 ? "Valve Index radio" : d.board == 1 ? "Holyiot 21017" : d.board == 2 ? "PCA10059" : d.board == 3 ? (d.bank == 2 ? "Kuroshin, bank B" : "Kuroshin, bank A") : d.softdeviceVariant ? "Nordic bootloader" : "bare",
                   d.watchdog ? ", watchdog" : "");
     row("Firmware", t);
     row("Up for", Uptime(d.uptimeMs));
@@ -897,7 +897,9 @@ void Ui::Firmware(const DongleState& d) {
 
   ImGui::Spacing();
   ImGui::SeparatorText("Update");
-  if (d.Banked()) {
+  if (d.IndexRadio()) {
+    ImGui::TextWrapped("Update it from openhouse-installer: Update Dongles");
+  } else if (d.Banked()) {
     // Updates itself: the packaged firmware for the bank that isn't running.
     const fs::path image = PackagedBankImage(lh::dongle_bank::ImageName(d.board, d.softdeviceVariant, d.bank));
     if (image.empty()) ImGui::TextColored(kWarn, "Firmware not found next to the app");

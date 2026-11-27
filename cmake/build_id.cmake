@@ -1,6 +1,7 @@
 # Stamps the build's version: the base version from include/lh/version.hpp, plus
 # -<short commit> (and -dirty with uncommitted changes) unless this is a release build
-# (OPENHOUSE_RELEASE=1: scripts/build-*.sh --release). Runs on every build; writes
+# (OPENHOUSE_RELEASE=1: scripts/build-*.sh --release; OPENHOUSE_BUILD_COMMIT gives the commit
+# where there's no git checkout, as in the Nix flake). Runs on every build; writes
 # OUT/generated/lh/build_id.h and OUT/VERSION.txt only when they change, and
 # OUT/generated/lh/build_time.h (when this build was made, Unix seconds) every time: only the
 # driver's version export and the installer include it, so it doesn't rebuild the rest.
@@ -9,7 +10,12 @@ file(STRINGS "${SRC}/include/lh/version.hpp" line REGEX "^#define LH_VERSION_BAS
 string(REGEX REPLACE ".*\"(.*)\".*" "\\1" base "${line}")
 set(suffix "")
 set(commit "")
-if(NOT "$ENV{OPENHOUSE_RELEASE}" STREQUAL "1")
+if(NOT "$ENV{OPENHOUSE_RELEASE}" STREQUAL "1" AND NOT "$ENV{OPENHOUSE_BUILD_COMMIT}" STREQUAL "")
+  # A build without the git checkout (the Nix flake): the commit it was given, as git would say it.
+  set(commit "$ENV{OPENHOUSE_BUILD_COMMIT}")
+  string(REGEX REPLACE "-dirty$" "" commit "${commit}")
+  set(suffix "-$ENV{OPENHOUSE_BUILD_COMMIT}")
+elseif(NOT "$ENV{OPENHOUSE_RELEASE}" STREQUAL "1")
   find_package(Git QUIET)
   if(GIT_FOUND)
     execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${SRC}" rev-parse --short=7 HEAD

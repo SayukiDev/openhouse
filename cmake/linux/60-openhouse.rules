@@ -1,0 +1,14 @@
+# openhouse: lets the logged-in user's openhouse driver, installer and tools open these devices.
+# Valve lighthouse devices: Watchman dongles, trackers, controllers, headsets (hidraw, and USB for
+# SteamVR's firmware updater).
+KERNEL=="hidraw*", ATTRS{idVendor}=="28de", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="28de", MODE="0660", TAG+="uaccess"
+# HTC parts of VIVE headsets.
+KERNEL=="hidraw*", ATTRS{idVendor}=="0bb4", MODE="0660", TAG+="uaccess"
+# Doorman Dongle.
+KERNEL=="hidraw*", ATTRS{idVendor}=="6767", ATTRS{idProduct}=="0727", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="6767", ATTRS{idProduct}=="0727", MODE="0660", TAG+="uaccess"
+# Nordic's USB DFU bootloader (Holyiot, PCA10059): its serial port, kept away from ModemManager.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1915", ATTRS{idProduct}=="521f", MODE="0660", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+# Valve's radio bootloader (the Index headset's radio, flashed with Doorman): its serial port, the same.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="2104", MODE="0660", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"

@@ -1,6 +1,7 @@
 #include <cstdarg>
 #include <array>
 #include "usb_transport.hpp"
+#include "hid_list.hpp"
 
 #include <mutex>
 #include "device_config.hpp"
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -94,6 +96,7 @@ void ReportDecoder::AddEndpoint(const EndpointInfo& e) {
     dev = std::make_shared<DeviceState>();
     dev->id = e.serial;
   }
+  if (e.vid == 0x6767) dev->clock.SetMinimumWindow(true);   // a Doorman Dongle's slot
   if (e.gyroRange >= 0) dev->gyroRange = e.gyroRange;
   if (e.accelRange >= 0) dev->accelRange = e.accelRange;
   Ep ep;
@@ -267,18 +270,19 @@ bool UsbTransport::RequestProtocolVersion(hid_device_* dev, int version) {
   return hid_send_feature_report(dev, req, sizeof req) >= 0;
 }
 
-UsbTransport::OpenResult UsbTransport::OpenEndpoint(const hid_device_info* d, Open* out) {
+UsbTransport::OpenResult UsbTransport::OpenEndpoint(const HidEntry& entry, Open* out) {
+  const HidEntry* d = &entry;
   // One open at a time: hidapi's hid_open_path resets and sets a process-wide error string,
   // which parallel opens would free twice. The config read after it stays parallel.
   static std::mutex openMutex;
   hid_device* h = nullptr;
   {
     std::lock_guard openLock(openMutex);
-    h = hid_open_path(d->path);
+    h = hid_open_path(d->path.c_str());
   }
   if (!h) {
     std::lock_guard lock(pathsMutex_);
-    if (failedPaths_.insert(d->path).second) Log(LogLevel::Warn, "cannot open %s\n", d->path);
+    if (failedPaths_.insert(d->path).second) Log(LogLevel::Warn, "cannot open %s\n", d->path.c_str());
     return OpenResult::Failed;
   }
   {
@@ -287,16 +291,16 @@ UsbTransport::OpenResult UsbTransport::OpenEndpoint(const hid_device_info* d, Op
   }
   hid_set_nonblocking(h, 1);
   EndpointKind kind{};
-  Classify(d->product_id, d->interface_number, kind);
+  Classify(d->pid, d->iface, kind);
   Open& o = *out;
   o = Open{};
   o.dev = h;
   o.path = d->path;
-  o.info.vid = d->vendor_id;
-  o.info.pid = d->product_id;
-  o.info.iface = uint8_t(d->interface_number);
+  o.info.vid = d->vid;
+  o.info.pid = d->pid;
+  o.info.iface = uint8_t(d->iface);
   o.info.kind = kind;
-  o.info.serial = Narrow(d->serial_number);
+  o.info.serial = Narrow(d->serial.c_str());
   const double t0 = HostNow();
   DeviceInfo di;
   // Short query: a receiver without a device keeps answering "nothing yet".
@@ -327,25 +331,84 @@ UsbTransport::OpenResult UsbTransport::OpenEndpoint(const hid_device_info* d, Op
 void UsbTransport::Enumerate(bool startup) {
   static const bool ohOnly = getenv("LH_DOORMAN_ONLY") != nullptr;  // only the Doorman Dongle (testing)
   if (ohOnly) return;
-  hid_device_info* list = hid_enumerate(kValveVid, 0);
+  const std::vector<HidEntry> list = ListHid(kValveVid);
   std::set<std::string> present;
-  std::vector<hid_device_info*> fresh;
-  for (hid_device_info* d = list; d && !stop_; d = d->next) {
+  std::vector<HidEntry> fresh;
+  for (const HidEntry& d : list) {
+    if (stop_) break;
     EndpointKind kind;
-    if (!Classify(d->product_id, d->interface_number, kind)) continue;
-    present.insert(d->path);
+    if (!Classify(d.pid, d.iface, kind)) continue;
+    present.insert(d.path);
     std::lock_guard lock(pathsMutex_);
-    if (!paths_.count(d->path)) fresh.push_back(d);
+    if (!paths_.count(d.path) && !busyPaths_.count(d.path)) fresh.push_back(d);
   }
   // Opened in parallel: each reads its device's config (~0.4 s, wireless ~0.5 s), and a
-  // host only accepts devices for a few seconds after Init (Monado: 3 s).
+  // host only accepts devices for a few seconds after Init (Monado: 3 s). Each on its own
+  // thread, waited for up to the deadline; the state is shared, so a thread still stuck on its
+  // device when this returns finishes into lateOpens_ instead.
+  struct Batch {
+    std::mutex m;
+    std::condition_variable cv;
+    std::vector<Open> opened;
+    std::vector<OpenResult> results;
+    std::vector<char> done, late;
+    size_t remaining = 0;
+  };
+  auto batch = std::make_shared<Batch>();
+  batch->opened.resize(fresh.size());
+  batch->results.assign(fresh.size(), OpenResult::Failed);
+  batch->done.assign(fresh.size(), 0);
+  batch->late.assign(fresh.size(), 0);
+  batch->remaining = fresh.size();
+  for (size_t i = 0; i < fresh.size(); ++i) {
+    ++openWorkers_;
+    std::thread([this, batch, entry = fresh[i], i] {
+      Open o;
+      const OpenResult result = OpenEndpoint(entry, &o);
+      bool late = false;
+      {
+        std::lock_guard lock(batch->m);
+        batch->opened[i] = o;
+        batch->results[i] = result;
+        batch->done[i] = 1;
+        late = batch->late[i];
+        --batch->remaining;
+      }
+      batch->cv.notify_all();
+      if (late) {
+        {
+          std::lock_guard lock(pathsMutex_);
+          busyPaths_.erase(entry.path);
+        }
+        if (result == OpenResult::Failed) {
+          Log(LogLevel::Info, "%s answered, but couldn't be opened; trying again\n", Narrow(entry.serial.c_str()).c_str());
+        } else {
+          std::lock_guard lock(pendingMutex_);
+          lateOpens_.emplace_back(o, result);
+        }
+      }
+      --openWorkers_;
+    }).detach();
+  }
   std::vector<Open> opened(fresh.size());
   std::vector<OpenResult> results(fresh.size(), OpenResult::Failed);
   {
-    std::vector<std::thread> workers;
-    for (size_t i = 0; i < fresh.size(); ++i)
-      workers.emplace_back([&, i] { results[i] = OpenEndpoint(fresh[i], &opened[i]); });
-    for (auto& w : workers) w.join();
+    std::unique_lock lock(batch->m);
+    batch->cv.wait_for(lock, std::chrono::milliseconds(kOpenDeadlineMs), [&] { return batch->remaining == 0; });
+    for (size_t i = 0; i < fresh.size(); ++i) {
+      if (batch->done[i]) {
+        opened[i] = batch->opened[i];
+        results[i] = batch->results[i];
+        continue;
+      }
+      batch->late[i] = 1;   // its thread hands it over when it's done
+      {
+        std::lock_guard pathsLock(pathsMutex_);
+        busyPaths_.insert(fresh[i].path);
+      }
+      Log(LogLevel::Warn, "%s (%s) isn't answering; going on without it. If it stays that way, unplug it and plug it back in\n",
+          Narrow(fresh[i].serial.c_str()).c_str(), fresh[i].path.c_str());
+    }
   }
   // Every opened handle goes to a list Stop() closes, stopping or not.
   for (size_t i = 0; i < fresh.size(); ++i) {
@@ -370,7 +433,6 @@ void UsbTransport::Enumerate(bool startup) {
       havePending_ = true;
     }
   }
-  hid_free_enumeration(list);
   if (startup) return;
   // A receiver unplugged while it had no device: nothing reads it, so notice here.
   for (size_t i = 0; i < idle_.size();) {
@@ -383,6 +445,32 @@ void UsbTransport::Enumerate(bool startup) {
       paths_.erase(idle_[i].path);
     }
     idle_.erase(idle_.begin() + long(i));
+  }
+}
+
+void UsbTransport::TakeLateOpens() {
+  std::vector<std::pair<Open, OpenResult>> late;
+  {
+    std::lock_guard lock(pendingMutex_);
+    late.swap(lateOpens_);
+  }
+  for (auto& [o, result] : late) {
+    if (stop_) {
+      hid_close(o.dev);
+      continue;
+    }
+    {
+      std::lock_guard lock(pathsMutex_);
+      paths_.insert(o.path);
+    }
+    Log(LogLevel::Info, "%s: answering now (%s)\n", o.info.serial.c_str(), o.path.c_str());
+    if (result == OpenResult::Idle) {
+      idle_.push_back(o);
+    } else {
+      std::lock_guard lock(pendingMutex_);
+      pending_.push_back(o);
+      havePending_ = true;
+    }
   }
 }
 
@@ -402,7 +490,14 @@ bool UsbTransport::Start() {
   }
   nextEp_ = 0;
   stop_ = false;
-  Enumerate(true);
+  {
+    // Steam's watchdog (this driver, loaded in Steam) may be mid-query on a dongle: two
+    // processes' device-info requests at once wedge it, and the next HID read here then
+    // hangs until SteamVR aborts the driver. Its poll is short; it then sees vrserver and stops.
+    lh::platform::DongleQueryLock lock;
+    if (!lock.Acquire(std::chrono::seconds(3))) Log(LogLevel::Warn, "Steam's watchdog still busy with the dongles; going ahead\n");
+    Enumerate(true);
+  }
   bool unopenable = false;
   {
     std::lock_guard lock(pathsMutex_);
@@ -763,6 +858,7 @@ void UsbTransport::ProbeMain() {
   };
   while (!stop_) {
     ScanDoorman();   // Doorman Dongles: listed here, opened by the reader thread (also with LH_DOORMAN_ONLY)
+    TakeLateOpens();
     Enumerate(false);
     for (size_t i = 0; i < idle_.size() && !stop_;) {
       serve();
@@ -796,6 +892,18 @@ void UsbTransport::Stop() {
   stop_ = true;
   if (probe_.joinable()) probe_.join();
   if (thread_.joinable()) thread_.join();
+  // Opens still stuck on a device: a while for them to give up (each HID call does, in the end).
+  for (int i = 0; i < 100 && openWorkers_ > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  if (openWorkers_ > 0) Log(LogLevel::Warn, "%d device(s) still not answering at shutdown\n", int(openWorkers_));
+  {
+    std::lock_guard lock(pendingMutex_);
+    for (auto& [o, result] : lateOpens_) hid_close(o.dev);
+    lateOpens_.clear();
+  }
+  {
+    std::lock_guard lock(pathsMutex_);
+    busyPaths_.clear();
+  }
   for (auto& o : idle_) hid_close(o.dev);
   idle_.clear();
   for (auto& o : pending_) hid_close(o.dev);

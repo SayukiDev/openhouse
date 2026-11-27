@@ -27,6 +27,7 @@
 
 struct hid_device_;
 struct hid_device_info;
+namespace lh::usb { struct HidEntry; }
 
 namespace lh::usb {
 
@@ -180,8 +181,14 @@ class UsbTransport {
   };
   enum class OpenResult { Failed, Idle, Ready };
   // Opens and sets up one enumerated HID interface (Start and hotplug).
-  OpenResult OpenEndpoint(const ::hid_device_info* d, Open* out);
-  void Enumerate(bool startup);  // opens interfaces not open yet
+  OpenResult OpenEndpoint(const lh::usb::HidEntry& d, Open* out);
+  // Opens interfaces not open yet. Each open has its own thread and Enumerate waits for them
+  // up to kOpenDeadline: a device that doesn't answer (a wedged dongle blocks Windows HID calls
+  // with no timeout) must never hold up SteamVR loading the driver, nor the other devices. One
+  // that finishes later is handed to the probe thread (TakeLateOpens).
+  void Enumerate(bool startup);
+  void TakeLateOpens();  // probe thread
+  static constexpr int kOpenDeadlineMs = 5000;
   void CompleteSetup(Open& o, bool supportsVersioning);
   void RequestVersion(Open& o);
   void Run();
@@ -232,6 +239,12 @@ class UsbTransport {
   // its interface goes away, so a replugged receiver is opened again.
   std::set<std::string> paths_;
   std::set<std::string> failedPaths_;  // logged once (e.g. held open by SteamVR)
+  // Opens past their deadline, still waiting on the device: not opened again meanwhile.
+  std::set<std::string> busyPaths_;
+  // Opens that finished after their deadline (guarded by pendingMutex_), and the open threads
+  // still running (Stop waits for them a while).
+  std::vector<std::pair<Open, OpenResult>> lateOpens_;
+  std::atomic<int> openWorkers_{0};
   std::mutex pathsMutex_;
   std::atomic<uint16_t> nextEp_{0};
   std::thread thread_;

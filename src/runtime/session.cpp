@@ -413,6 +413,7 @@ class SessionImpl final : public Session, public InputSinkBase {
   double solveInterval_ = 1.0;  // grows while solves stop moving the bases (see ApplySolve)
   std::map<uint32_t, Eigen::Isometry3d> lastSolved_;  // previous solve's bases
   double lastAdvance_ = -1e300;  // room bases gliding to solved poses
+  std::string levelSettledRoom_;   // the room whose settled level was logged
   std::condition_variable solverWake_;
   std::thread solver_;
 #ifdef LH_RUNTIME_USB
@@ -1175,7 +1176,16 @@ void SessionImpl::OnBattery(const DeviceId& id, const BatteryReport& b) {
 }
 
 void SessionImpl::Process(const DeviceId& id, Device& d) {
-  if (now_ - lastAdvance_ >= 0.01) { lastAdvance_ = now_; room_.Advance(now_); }
+  if (now_ - lastAdvance_ >= 0.01) {
+    lastAdvance_ = now_;
+    room_.Advance(now_);
+    // Once per room: its level is in (what SteamVR's frame is levelled to, RawAlignment).
+    const Room* room = room_.Active();
+    if (room && room->id != levelSettledRoom_ && room_.LevelSettled()) {
+      levelSettledRoom_ = room->id;
+      Emit(SessionEventType::Log, "", "room " + room->id + ": level settled");
+    }
+  }
   std::vector<std::pair<BaseConfig, BaseDynamicState>> decoded;
   BaseConfig config;
   BaseDynamicState dynamic;
@@ -1616,6 +1626,7 @@ SessionSnapshot SessionImpl::Snapshot() const {
   snap.roomRevision = room_.Revision();
   if (const Room* room = room_.Active()) snap.roomId = room->id;
   snap.originEpoch = room_.OriginEpoch();
+  snap.levelSettled = room_.LevelSettled();
   for (const auto& [id, d] : devices_) {
     if (!d.tracker) continue;  // receivers / devices without a usable tracking config
     DeviceState s;

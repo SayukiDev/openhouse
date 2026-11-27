@@ -251,6 +251,10 @@ bool RoomMap::ImportSteamDatabase(const std::string& text, std::string* error) {
           base.positionVariance = std::max(variance, 1e-6);
           base.rotationVariance = std::max(variance, 1e-6);
           base.origin = variance == 0.0 && p[4] == 0 && p[5] == 0 && p[6] == 0;
+          // SteamVR's heading, origin and floor are kept; its level (the stock driver's, from Valve's
+          // accelerometers, maybe years ago) is no better than a base's own accelerometer, so the
+          // devices level the room as they do a new one (RefineOriginTilt) before it's settled.
+          if (base.origin) base.rotationVariance = kImportedLevelVariance;
           base.observations = 1;
           room.bases[base.serial] = base;
         }
@@ -917,6 +921,23 @@ void RoomMap::Advance(double time) {
   }
 }
 
+// The tilt variance the devices' filters give is no guide: in replays it said 0.04-0.15 deg while
+// the next estimate differed by 0.4-2.8 deg. Settled: no new level for kQuiet seconds, and none
+// still gliding in. A stored room that isn't re-levelled when it loads is settled at once.
+bool RoomMap::LevelSettled() const {
+  constexpr double kQuiet = 60, kApplied = 0.05 * 0.017453292519943295;
+  const Room* room = Active();
+  if (!room) return false;
+  for (const auto& [serial, b] : room->bases) {
+    if (!b.origin) continue;
+    // No level this session: a stored room's (a fresh origin has only its base's accelerometer, 1.5e-4).
+    if (!levelTarget_) return b.rotationVariance < 1e-4;
+    if (!(advanceTime_ - levelTargetAt_ > kQuiet)) return false;
+    return Eigen::AngleAxisd(*levelTarget_ * b.worldFromBase.rotation().transpose()).angle() < kApplied;
+  }
+  return false;
+}
+
 bool RoomMap::RefineOriginTilt(uint32_t serial, const std::array<double, 2>& tilt, double tiltVariance, double time) {
   constexpr double kLevelSlew = 0.05 * 0.017453292519943295, kFirstLevelSlew = 2.0 * 0.017453292519943295;  // rad/s
   Room* room = ActiveRoom();
@@ -926,12 +947,13 @@ bool RoomMap::RefineOriginTilt(uint32_t serial, const std::array<double, 2>& til
   RoomBase& origin = found->second;
   if (tiltVariance < 0.5 * origin.rotationVariance) {
     levelTarget_ = Leveling(tilt[0], tilt[1], 0);
+    levelTargetAt_ = advanceTime_;   // host time (time is the device filter's clock)
     origin.rotationVariance = tiltVariance;
     const double angle = Eigen::AngleAxisd(*levelTarget_ * origin.worldFromBase.rotation().transpose()).angle();
     if (angle > 0.0017) {
       char text[200];
-      std::snprintf(text, sizeof text, "Re-levelling room %s from %08X tilt by %.2f deg%s", room->id.c_str(), serial,
-                    angle * 57.29577951308232, levelled_ ? " (gradually)" : "");
+      std::snprintf(text, sizeof text, "Re-levelling room %s from %08X tilt by %.2f deg (sigma %.2f deg)%s", room->id.c_str(), serial,
+                    angle * 57.29577951308232, std::sqrt(tiltVariance) * 57.29577951308232, levelled_ ? " (gradually)" : "");
       Log(text);
     }
   }
@@ -976,7 +998,7 @@ void RoomMap::ForgetAll() {
   lastObservation_.clear();
   relearned_.clear();
   levelTarget_.reset();
-  levelTime_ = advanceTime_ = std::numeric_limits<double>::quiet_NaN();
+  levelTime_ = advanceTime_ = levelTargetAt_ = std::numeric_limits<double>::quiet_NaN();
   solvedTarget_.clear();
   levelled_ = false;
   accel_.clear();

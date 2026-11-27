@@ -20,7 +20,9 @@ namespace {
 
 constexpr uint16_t kVid = 0x6767, kPid = 0x0727;
 // Radio path latency on top of the wired 0.9 ms the IMU parser already subtracts
-// (sample -> LPC -> SPI -> air, up to one TDMA cycle -> USB). ClockSync follows the minimum.
+// (sample -> LPC -> SPI -> air -> USB; radios from 0x6A000027 / 0x0A000018 answer with what came
+// up to just before their poll, older ones up to a whole TDMA cycle more). ClockSync follows the
+// minimum over a window (ClockSync::SetMinimumWindow).
 constexpr double kExtraLatency = 0.0015;
 constexpr double kFeatureTimeout = 0.15;
 
@@ -72,7 +74,7 @@ std::vector<DoormanDongleFound> FindDoormanDongles(const hid_device_info* list, 
   std::map<std::string, Listed> bySerial;
   for (const hid_device_info* d = list; d; d = d->next) {
     if (d->vendor_id != kVid || d->product_id != kPid || !d->path) continue;
-    if (Narrow(d->product_string).rfind("Doorman Dongle", 0) != 0) continue;   // "Doorman Dongle <board>"
+    if (Narrow(d->product_string).rfind("Doorman ", 0) != 0) continue;   // "Doorman Dongle <board>", "Doorman Valve Index Radio"
     if (d->interface_number < 0 || d->interface_number >= kDoormanInterfaces) continue;
     auto& l = bySerial[Narrow(d->serial_number)];
     l.paths[size_t(d->interface_number)].push_back(d->path);

@@ -269,12 +269,62 @@ TEST(RawAlignment, TakesTheLevelFromOurRoomNotAStaleDatabase) {
   EXPECT_EQ(alignment.RoomId(), "steamvr-77");
 }
 
-// A small disagreement with lighthousedb.json's level (Valve's accelerometers, ours:
-// 2 deg) keeps SteamVR's frame exactly: the anchor where SteamVR has it, so tools
-// aligning that frame (some reset past a few degrees) see no move. Our room turning
-// inside (re-levelling) changes nothing in the host frame either.
-TEST(RawAlignment, KeepsSteamVRsFrameForSmallLevelDifferencesAndNeverDrifts) {
+// A small disagreement with lighthousedb.json's level (the stock driver's estimate from Valve's
+// accelerometers, maybe years old: 2 deg here; 1.4-1.9 deg in a user's universe, the view leaning
+// one way facing forward and the other turned around). Until our room's level settles, SteamVR's
+// frame is kept as it is; then it glides to our level about SteamVR's origin (the floor there
+// stays) and is held: our room re-levelling afterwards changes nothing in the host frame.
+TEST(RawAlignment, LevelsSmallDifferencesOnceOurLevelSettlesAndNeverDrifts) {
   const auto path = (std::filesystem::temp_directory_path() / ("lh-test-rawalign2-" + std::to_string(lh::platform::ProcessId()) + ".json")).string();
+  {
+    std::ofstream f(path);
+    f << R"({"known_universes": [{"id": "77", "tilt": {"pitch": 0.035, "roll": 0.0},
+             "base_stations": [{"base_serial_number": 1,
+               "target_pose": {"pose": [0, 0, 0, 1, 1, 2, 3], "variance": 0}}]}],
+           "base_stations": [{"config": {"serialNumber": 1, "baseCalibration": [0,0,0,0,0,0,0,0,0,0,0,0,0,0]},
+             "dynamic_states": [{"dynamic_state": {"reset_count": 1}}]}]})";
+  }
+  lh::openvr::RawAlignment alignment;
+  std::string error;
+  ASSERT_TRUE(alignment.Load(path, &error)) << error;
+  std::filesystem::remove(path);
+  lh::SessionSnapshot snapshot;
+  lh::BaseStationState base;
+  base.id = 1; base.known = base.seen = base.origin = true;
+  base.worldFromBase.orientation = {1, 0, 0, 0};
+  snapshot.bases.push_back(base);
+  const auto tilt = [&] { return std::acos(std::clamp((alignment.RawFromWorld().rotation() * Eigen::Vector3d::UnitY()).y(), -1.0, 1.0)); };
+  ASSERT_TRUE(alignment.Update(snapshot));
+  const Eigen::Isometry3d steam = alignment.RawFromWorld();
+  EXPECT_GT(tilt(), 0.03) << "SteamVR's 2 deg tilt, while our level isn't known";
+  EXPECT_LT(alignment.LevelTrimDegrees(), 0);
+  const Eigen::Vector3d originInWorld = steam.inverse() * Eigen::Vector3d::Zero();
+  // our level settles: the frame glides to it, never by more than 0.5 deg/s
+  snapshot.levelSettled = true;
+  double last = tilt();
+  for (int i = 1; i <= 100; ++i) {
+    snapshot.hostTime = 0.1 * i;
+    ASSERT_TRUE(alignment.Update(snapshot));
+    EXPECT_LE(std::abs(tilt() - last), 0.5 * 0.0175 * 0.1 + 1e-9);
+    last = tilt();
+  }
+  EXPECT_NEAR(alignment.LevelTrimDegrees(), 2.0, 0.1);
+  EXPECT_LT(tilt(), 1e-6) << "level";
+  EXPECT_LT((alignment.RawFromWorld() * originInWorld).norm(), 1e-9) << "SteamVR's origin (the floor there) stays";
+  const Eigen::Vector3d heading = alignment.RawFromWorld().rotation() * Eigen::Vector3d::UnitX();
+  EXPECT_NEAR(std::atan2(-heading.z(), heading.x()), 0.0, 1e-3) << "SteamVR's heading kept";
+  // then our room re-levels by 1 deg: the anchor's raw pose, and every device's, stay
+  const Eigen::Isometry3d anchorRaw = alignment.RawFromWorld();
+  const Eigen::Quaterniond turn(Eigen::AngleAxisd(0.017, Eigen::Vector3d::UnitX()));
+  snapshot.bases[0].worldFromBase.orientation = {turn.w(), turn.x(), turn.y(), turn.z()};
+  snapshot.hostTime += 0.1;
+  ASSERT_TRUE(alignment.Update(snapshot));
+  EXPECT_TRUE((alignment.RawFromWorld() * Eigen::Isometry3d(turn)).isApprox(anchorRaw, 1e-9));
+}
+
+// A room whose level never settles still gets SteamVR's frame levelled, after a wait.
+TEST(RawAlignment, LevelsAfterAWaitWhenOurLevelNeverSettles) {
+  const auto path = (std::filesystem::temp_directory_path() / ("lh-test-rawalign3-" + std::to_string(lh::platform::ProcessId()) + ".json")).string();
   {
     std::ofstream f(path);
     f << R"({"known_universes": [{"id": "77", "tilt": {"pitch": 0.035, "roll": 0.0},
@@ -292,16 +342,11 @@ TEST(RawAlignment, KeepsSteamVRsFrameForSmallLevelDifferencesAndNeverDrifts) {
   base.id = 1; base.known = base.seen = base.origin = true;
   base.worldFromBase.orientation = {1, 0, 0, 0};
   snapshot.bases.push_back(base);
-  ASSERT_TRUE(alignment.Update(snapshot));
-  const Eigen::Isometry3d first = alignment.RawFromWorld();
-  const Eigen::Isometry3d anchorRaw = first;  // the anchor at our identity
-  EXPECT_GT(std::acos((anchorRaw.rotation() * Eigen::Vector3d::UnitY()).y()), 0.03) << "SteamVR's 2 deg tilt kept";
-  // our room re-levels by 1 deg: the anchor's raw pose, and every device's, stay
-  const Eigen::Quaterniond turn(Eigen::AngleAxisd(0.017, Eigen::Vector3d::UnitX()));
-  snapshot.bases[0].worldFromBase.orientation = {turn.w(), turn.x(), turn.y(), turn.z()};
-  ASSERT_TRUE(alignment.Update(snapshot));
-  const Eigen::Isometry3d worldFromAnchor(turn);
-  EXPECT_TRUE((alignment.RawFromWorld() * worldFromAnchor).isApprox(anchorRaw, 1e-9));
+  for (int i = 0; i <= 1190; ++i) { snapshot.hostTime = 0.1 * i; ASSERT_TRUE(alignment.Update(snapshot)); }
+  EXPECT_LT(alignment.LevelTrimDegrees(), 0) << "still waiting at 119 s";
+  for (int i = 1191; i <= 1300; ++i) { snapshot.hostTime = 0.1 * i; ASSERT_TRUE(alignment.Update(snapshot)); }
+  EXPECT_GT(alignment.LevelTrimDegrees(), 1.9);
+  EXPECT_NEAR((alignment.RawFromWorld().rotation() * Eigen::Vector3d::UnitY()).y(), 1.0, 1e-9);
 }
 
 TEST(RawAlignment, PreservesHostFrameAcrossRoomRebuild) {
@@ -412,6 +457,26 @@ TEST(RoomPublisher, SettlesAfterTheRoomStopsMovingAndBumpsTheEpochOnARealChange)
   for (int i = 0; i < 16; ++i) settled = s.Update(room(0.001), t += 0.25);
   EXPECT_TRUE(settled);
   EXPECT_EQ(s.epoch(), 2u);
+}
+
+// A room that stopped moving isn't published as settled until its level has settled too (SteamVR's
+// frame is levelled to it then): a tool aligning once it's settled never sees it tilt afterwards.
+TEST(RoomPublisher, NotSettledUntilTheLevelIs) {
+  lh::SessionSnapshot snapshot;
+  snapshot.roomId = "room-test";
+  lh::BaseStationState base;
+  base.serial = "LHB-A101B835"; base.id = 0xA101B835; base.known = base.seen = base.origin = base.learned = true;
+  base.worldFromBase.orientation = {1, 0, 0, 0};
+  snapshot.bases.push_back(base);
+  lh::openvr::RoomPublisher publisher;
+  double t = 0;
+  for (; t < 5; t += 0.25) publisher.Publish(snapshot, Eigen::Isometry3d::Identity(), t);
+  EXPECT_FALSE(publisher.Settled()) << "still, but its level isn't settled";
+  EXPECT_NE(publisher.TakeLog().find("waiting for its level"), std::string::npos);
+  snapshot.levelSettled = true;
+  publisher.Publish(snapshot, Eigen::Isometry3d::Identity(), t);
+  EXPECT_TRUE(publisher.Settled());
+  publisher.Close();
 }
 
 TEST(HostFrame, PinsTheOriginAcrossRelevelsAndSessions) {

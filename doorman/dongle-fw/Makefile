@@ -1,14 +1,16 @@
-# doorman dongle firmware (nRF52840 Dongle, ai/doorman/dongle-fw.md)
+# Doorman dongle firmware (ai/doorman/dongle-fw.md)
 # make            -> every board's install image and bank images (below)
+# make idx       -> the Valve Index HMD radio image (ai/doorman/index-radio.md)
+# make check-nrf52833 -> compile/link and convert the board-independent build check
 CC = arm-none-eabi-gcc
 OBJCOPY = arm-none-eabi-objcopy
 TUSB = ../third_party/tinyusb
 NRFX = ../third_party/nrfx
 CFLAGS = -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 -Os -g -ffunction-sections -fdata-sections \
-  -Wall -Wextra -Wno-unused-parameter -std=gnu11 -DNRF52840_XXAA -DCFG_TUSB_MCU=OPT_MCU_NRF5X \
+  -Wall -Wextra -Wno-unused-parameter -std=gnu11 -DCFG_TUSB_MCU=OPT_MCU_NRF5X \
   -Isrc -I../common -I$(TUSB)/src -I$(NRFX) -I$(NRFX)/mdk -I$(NRFX)/hal -I$(NRFX)/drivers/include -I$(NRFX)/drivers/src -I$(NRFX)/templates \
   -I../third_party/CMSIS_5/CMSIS/Core/Include -D__STACK_SIZE=4096 -D__HEAP_SIZE=0
-SRCS = src/main.c src/link.c src/usb_descriptors.c $(NRFX)/mdk/system_nrf52840.c \
+sources = src/main.c src/link.c src/usb_descriptors.c $(NRFX)/mdk/system_$(1).c \
   $(TUSB)/src/tusb.c $(TUSB)/src/common/tusb_fifo.c $(TUSB)/src/device/usbd.c $(TUSB)/src/device/usbd_control.c \
   $(TUSB)/src/class/hid/hid_device.c $(TUSB)/src/portable/nordic/nrf5x/dcd_nrf5x.c
 LDFLAGS = -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 -Wl,--gc-sections -L$(NRFX)/mdk -specs=nano.specs -specs=nosys.specs
@@ -18,28 +20,56 @@ LDFLAGS = -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 -Wl,--gc-se
 #   build/doorman_dongle_<v>.hex (.uf2)       boot stub + bank A's image: what a bootloader installs
 #                                             (first install or rescue)
 VARIANTS = sd nosd holyiot pca10059 kuroshin
-layout = $(if $(filter sd,$(1)),sd,std)
-board_flags = -DVARIANT_SD=$(if $(filter sd,$(1)),1,0) -DBANK_LAYOUT_SD=$(if $(filter sd,$(1)),1,0) \
+# A board selects its SoC and flash layout independently. Existing boards default to nrf52840/std.
+layout_sd = sd
+soc_check_52833 = nrf52833
+layout_check_52833 = 833_uf2
+soc = $(or $(soc_$(1)),nrf52840)
+device_nrf52840 = NRF52840_XXAA
+device_nrf52833 = NRF52833_XXAA
+family_nrf52840 = 0xADA52840
+family_nrf52833 = 0x621E937A
+layout = $(or $(layout_$(1)),std)
+startup = $(NRFX)/mdk/gcc_startup_$(call soc,$(1)).S
+chip_flags = -D$(device_$(call soc,$(1))) -DBANK_LAYOUT_833_UF2=$(if $(filter 833_uf2,$(call layout,$(1))),1,0)
+uses_sd = $(if $(filter sd,$(call layout,$(1))),1,0)
+board_flags = -DVARIANT_SD=$(call uses_sd,$(1)) -DBANK_LAYOUT_SD=$(call uses_sd,$(1)) \
   -DBOARD_HOLYIOT=$(if $(filter holyiot,$(1)),1,0) -DBOARD_PCA10059=$(if $(filter pca10059,$(1)),1,0) \
   -DBOARD_KUROSHIN=$(if $(filter kuroshin,$(1)),1,0)
 
 all: $(foreach v,$(VARIANTS),build/doorman_dongle_$(v).hex build/doorman_dongle_$(v)_a.bin build/doorman_dongle_$(v)_b.bin) \
-  build/doorman_dongle_sd.uf2 build/doorman_dongle_nosd.uf2
+  build/doorman_dongle_sd.uf2 build/doorman_dongle_nosd.uf2 build/doorman_dongle_idx.bin
 
 define variant
-build/doorman_dongle_$(1)_%.elf: $(SRCS) $(NRFX)/mdk/gcc_startup_nrf52840.S src/*.h ../common/*.h ld/bank_$(call layout,$(1))_%.ld
+build/doorman_dongle_$(1).uf2: UF2_FAMILY = $(family_$(call soc,$(1)))
+build/doorman_dongle_$(1)_%.elf: Makefile $(call sources,$(call soc,$(1))) $(call startup,$(1)) src/*.h ../common/*.h $(NRFX)/mdk/nrf_common.ld ld/bank_$(call layout,$(1))_%.ld
 	@mkdir -p build
-	$(CC) $(CFLAGS) $(call board_flags,$(1)) $(SRCS) $(NRFX)/mdk/gcc_startup_nrf52840.S \
+	$(CC) $(CFLAGS) $(call chip_flags,$(1)) $(call board_flags,$(1)) $(call sources,$(call soc,$(1))) $(call startup,$(1)) \
 	  $(LDFLAGS) -Tld/bank_$(call layout,$(1))_$$*.ld -Wl,-Map=build/doorman_dongle_$(1)_$$*.map -o $$@
 	arm-none-eabi-size $$@
 
 # the boot stub, with bank A's image as payload
-build/doorman_dongle_$(1).elf: src/stub.c src/banks.h ld/stub_$(call layout,$(1)).ld build/doorman_dongle_$(1)_a.bin
-	$(CC) $(CFLAGS) $(call board_flags,$(1)) -DPAYLOAD_BIN='"build/doorman_dongle_$(1)_a.bin"' src/stub.c -nostartfiles -nostdlib \
+build/doorman_dongle_$(1).elf: Makefile src/stub.c src/banks.h src/dongle.h ld/stub_$(call layout,$(1)).ld build/doorman_dongle_$(1)_a.bin
+	$(CC) $(CFLAGS) $(call chip_flags,$(1)) $(call board_flags,$(1)) -DPAYLOAD_BIN='"build/doorman_dongle_$(1)_a.bin"' src/stub.c -nostartfiles -nostdlib \
 	  $(LDFLAGS) -Tld/stub_$(call layout,$(1)).ld -Wl,-Map=build/doorman_dongle_$(1).map -o $$@
 	arm-none-eabi-size $$@
 endef
-$(foreach v,$(VARIANTS),$(eval $(call variant,$(v))))
+$(foreach v,$(VARIANTS) check_52833,$(eval $(call variant,$(v))))
+
+# Exercises both banks and the install-image pipeline. These files have no board-specific pin map.
+check-nrf52833: build/doorman_dongle_check_52833.uf2 build/doorman_dongle_check_52833_b.bin
+
+# Valve Index HMD radio ("gravidongle", ai/doorman/index-radio.md): nRF52840 + S140 6.1.1, one image at 0x26000
+# updated through Valve's serial-DFU bootloader; no banks, no stub.
+build/doorman_dongle_idx.elf: Makefile $(call sources,nrf52840) $(call startup,idx) src/*.h ../common/*.h $(NRFX)/mdk/nrf_common.ld ld/app_idx.ld
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(call chip_flags,idx) -DVARIANT_SD=1 -DBANK_LAYOUT_SD=0 -DBOARD_IDX=1 $(call sources,nrf52840) $(call startup,idx) \
+	  $(LDFLAGS) -Tld/app_idx.ld -Wl,-Map=build/doorman_dongle_idx.map -o $@
+	arm-none-eabi-size $@
+build/doorman_dongle_idx.bin: build/doorman_dongle_idx.elf
+	$(OBJCOPY) -O binary $< $@
+	truncate -s %4 $@
+idx: build/doorman_dongle_idx.bin
 
 # a bank image as raw bytes from its first address, padded to whole words
 build/%_a.bin: build/%_a.elf
@@ -50,10 +80,11 @@ build/%_b.bin: build/%_b.elf
 	truncate -s %4 $@
 build/%.hex: build/%.elf
 	$(OBJCOPY) -O ihex $< $@
+UF2_FAMILY ?= $(family_nrf52840)
 build/%.uf2: build/%.hex
-	python3 tools/uf2conv.py -f 0xADA52840 -c -o $@ $< >/dev/null
+	python3 tools/uf2conv.py -f $(UF2_FAMILY) -c -o $@ $< >/dev/null
 
 clean:
 	rm -rf build
 .SECONDARY:
-.PHONY: all clean
+.PHONY: all clean check-nrf52833 idx

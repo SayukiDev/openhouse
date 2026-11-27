@@ -220,3 +220,5 @@ jobs:
       # The packages carry the images (scripts/stage-firmwares.py); this checks lhbs on the host.
       - name: Build and host test
         run: scripts/build-firmware.sh
+      - name: Check nRF52833 dongle build
+        run: make -C doorman/dongle-fw check-nrf52833

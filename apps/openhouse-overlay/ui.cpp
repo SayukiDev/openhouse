@@ -444,20 +444,13 @@ void Ui::FirmwareCard() {
   ImGui::TextColored(kWarn, "Firmware update needed");
   ImGui::PushTextWrapPos(0);
   ImGui::TextDisabled("%s", n.tag.c_str());
-#ifndef _WIN32
-  ImGui::TextUnformatted("Please run the installer and update your Doorman devices through the \"Update Dongles\" menu!");
-#endif
   ImGui::PopTextWrapPos();
   if (!n.error.empty()) ImGui::TextColored(kBad, "%s", n.error.c_str());
-#ifdef _WIN32
   const float ignore = ImGui::CalcTextSize("Ignore").x + ImGui::GetStyle().FramePadding.x * 2;
   if (ImGui::Button("Update", ImVec2(ImGui::GetContentRegionAvail().x - ignore - ImGui::GetStyle().ItemSpacing.x, 0)))
     confirm_ = true;
   ImGui::SameLine();
   if (ImGui::Button("Ignore", ImVec2(ignore, 0))) ActOnNotice(NoticeAction::Ignore);
-#else
-  if (ImGui::Button("OK", ImVec2(ImGui::GetContentRegionAvail().x, 0))) ActOnNotice(NoticeAction::Ignore);
-#endif
 }
 
 // A SteamVR update replaced the driver: across the top, above the sidebar and the page (which

@@ -40,7 +40,7 @@ void OfferUpdate(const std::string& tag);
 // (at the start, plugged in or replugged) is checked for firmware, and its devices for radios, older
 // than what the installed openhouse came with; old ones are shown (dialog; the overlay's card and
 // headset notification too), again for every dongle plugged in later. Update starts the installer
-// with --dongles (Windows). Under Monado / WiVRn it returns once the driver goes away.
+// with --dongles. Under Monado / WiVRn it returns once the driver goes away.
 void RunFirmwareCheck(bool underSteamVR);
 // The check for DRIVER_DIR (SteamVR/drivers/lighthouse/bin/<platform>); blocks while its dialog is
 // up. 0: nothing to say or an update offered, 1: the driver was replaced, 2: no folder.

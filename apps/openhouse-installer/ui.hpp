@@ -162,7 +162,7 @@ class Ui {
   double runningChecked_ = -1, accessChecked_ = -1;
   bool haveAccess_ = true;
   Job job_, closeJob_;
-  bool monadoCheck_ = true;
+  MonadoCheck monadoCheck_ = InstalledMonadoCheck();   // Linux: Envision plugin, systemd service or neither
   bool autoInstall_ = false, autoStarted_ = false, autoClosed_ = false;
   std::atomic<bool> quit_{false};  // set by the update job
   std::string updateTag_;
@@ -191,7 +191,16 @@ class Ui {
   // Dongle flow
   enum class DongleStep { Board, Detect, Flashing, Done } dongleStep_ = DongleStep::Board;
   int dongleBoard_ = 0;  // board picked: 0 UF2, 1 Holyiot 21017, 2 PCA10059 (DoormanDongleInfo::board)
-  struct DongleSeen { std::vector<Uf2Drive> drives; std::vector<std::string> ports; std::vector<DoormanDongleInfo> dongles; };
+  struct DongleSeen {
+    std::vector<Uf2Drive> drives;
+    std::vector<std::string> ports;
+    std::vector<DoormanDongleInfo> dongles;
+    std::vector<std::string> indexRadios, indexBootloaders;   // the Index's stock radios, and radios in Valve's bootloader
+  };
+  std::function<bool(Job&)> indexFlash_;   // waits for the Index warning's Continue
+  bool indexRestore_ = false;              // ...and it puts SteamVR's radio firmware back
+  bool indexRestoreOnly_ = false;          // the Index page from Restore Firmware: restore buttons only
+  void WatchDongles(int board);
   Watcher<DongleSeen> dongleSeen_;
   std::string dongleResult_;
 
@@ -200,7 +209,6 @@ class Ui {
   Watcher<std::vector<WiredDevice>> wired_;
   Watcher<std::vector<WirelessDevice>> wireless_;
   std::set<std::string> checked_;
-  std::set<std::string> accepted_;  // unknown devices the user accepted to flash anyway
   std::vector<StockModel> stockModels_;
   std::map<std::string, int> stockChoice_;  // doorman-dongle-manager device -> stockModels_ index
   std::vector<std::pair<std::string, std::string>> results_;  // device, result

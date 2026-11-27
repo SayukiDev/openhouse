@@ -340,7 +340,10 @@ SECTIONS
     
     
     /* .bss section */
-    . = ALIGN(4);
+    /* openhouse: 8, not 4. The section takes its contents' largest alignment (8 with a double or
+       long long in it); with 4 here these symbols sat before its padding, the zeroing ran 4 bytes
+       low and the last word of .bss (newlib's __atexit) kept what the RAM held: a crash at boot. */
+    . = ALIGN(8);
     __bss_start = .; PROVIDE(__bss_start__ = .);
     .bss (NOLOAD):
     {

@@ -1,5 +1,6 @@
 #include "radio.hpp"
 #include "common/dongle_bank.hpp"
+#include "common/nordic_dfu.hpp"
 
 #include <hidapi/hidapi.h>
 #include <nlohmann/json.hpp>
@@ -10,6 +11,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <thread>
 
@@ -302,6 +305,10 @@ bool FlashDoorman(const WirelessDevice& device, const RadioImage& image, const P
   progress(1, "Checking it on the device");
   r = AirRequest(d, slot, '[', Signature(image.data));
   if (r.empty() || r[2]) { *error = "the device's check of the firmware failed; its current radio firmware stays"; return false; }
+  // It's turned off now and can't say its new version: the dongle is told (firmware 0x002D+).
+  uint8_t set[5] = {uint8_t(slot)};
+  std::memcpy(set + 1, &image.version, 4);
+  d.Command(0x39, set, sizeof set);
   progress(1, "Turning the device off");
   const uint8_t off[] = {'P', 0x9f, 4, 'o', 'f', 'f', '!'};
   d.Send(slot, off, sizeof off);
@@ -687,6 +694,14 @@ std::vector<DongleSlot> ScanDongleSlots(const DoormanDongleInfo& dongle) {
   return out;
 }
 
+bool SetRememberedRadio(const std::string& donglePath, int slot, uint32_t version) {
+  DoormanDongle d(donglePath);
+  if (!d.Ok()) return false;
+  uint8_t set[5] = {uint8_t(slot)};
+  std::memcpy(set + 1, &version, 4);
+  return d.Command(0x39, set, sizeof set);
+}
+
 void PowerOffDevice(const WirelessDevice& device) {
   DoormanDongle d(device.donglePath);
   if (!d.Ok()) return;
@@ -713,7 +728,7 @@ std::vector<DoormanDongleInfo> FindDoormanDongles() {
     if (dev.Ok() && dev.Command(0x01, nullptr, 0, r) && std::memcmp(r + 1, "OHDG", 4) == 0) {
       o.firmware = uint16_t(r[5] | r[6] << 8);
       o.softDeviceBuild = r[7] != 0;
-      o.board = r[58] <= 3 ? r[58] : 0;
+      o.board = r[58] <= 4 ? r[58] : 0;
       o.bank = r[60] <= 2 ? r[60] : 0;
       o.slots = r[61] >= 1 && r[61] <= 16 ? r[61] : 8;
     }
@@ -747,6 +762,134 @@ bool RebootToBootloader(const DoormanDongleInfo& d) {
   DoormanDongle dev(d.path);
   if (!dev.Ok()) return false;
   dev.Command(0x10, nullptr, 0, nullptr, 200);  // it resets right away: no reply expected
+  return true;
+}
+
+// ---- the Index HMD's radio ----
+
+namespace {
+constexpr uint32_t kIndexAppBase = 0x26000, kIndexHw = 0x2102;   // S140 6.1.1 layout; Valve's radio hardware id
+
+std::string Upper(std::string s) {
+  for (auto& c : s) c = char(std::toupper(static_cast<unsigned char>(c)));
+  return s;
+}
+// "CEE3A511F0-RYB": the chip part, the same in the application and the bootloader.
+std::string Chip(const std::string& serial) { return Upper(serial.substr(0, serial.find('-'))); }
+}  // namespace
+
+std::vector<std::string> FindIndexRadios() {
+  std::vector<std::string> out;
+  hid_device_info* list = hid_enumerate(kValve, kWatchmanV2);
+  for (hid_device_info* d = list; d; d = d->next) {
+    const std::string serial = Upper(Narrow(d->serial_number));
+    if (!serial.empty() && std::find(out.begin(), out.end(), serial) == out.end()) out.push_back(serial);
+  }
+  hid_free_enumeration(list);
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+// The "-RYB" radio carries the headset's Bluetooth (base station power): keep it. Then the lowest
+// serial, so the same one is picked every time.
+std::string PickIndexRadio(const std::vector<std::string>& serials) {
+  for (const auto& s : serials)
+    if (s.size() < 4 || s.compare(s.size() - 4, 4, "-RYB") != 0) return s;
+  return serials.empty() ? "" : serials.front();
+}
+
+std::string IndexRadioPackage(const std::string& steamvrRoot) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path dir = fs::path(std::u8string(steamvrRoot.begin(), steamvrRoot.end())) / "drivers" / "indexhmd" / "resources" / "firmware" / "radio";
+  fs::path best;
+  for (const auto& e : fs::directory_iterator(dir, ec)) {
+    const std::string name = e.path().filename().string();
+    // gd_<unix time>_dfu.zip: the newest has the highest time
+    if (name.rfind("gd_", 0) == 0 && name.size() > 4 && name.substr(name.size() - 4) == ".zip" &&
+        (best.empty() || name > best.filename().string()))
+      best = e.path();
+  }
+  const auto u8 = best.u8string();
+  return std::string(u8.begin(), u8.end());
+}
+
+bool TriggerIndexRadioDfu(const std::string& serial) {
+  // Valve's "reboot into ISP" feature report; it can live on any of the radio's interfaces.
+  uint8_t report[64]{0xFF, 0x90, 0x04, 'z', 'o', 't', '!'};
+  bool sent = false;
+  hid_device_info* list = hid_enumerate(kValve, kWatchmanV2);
+  for (hid_device_info* d = list; d; d = d->next) {
+    if (Upper(Narrow(d->serial_number)) != Upper(serial)) continue;
+    if (hid_device* h = hid_open_path(d->path)) {
+      sent |= hid_send_feature_report(h, report, sizeof report) >= 0;   // it resets: an error proves nothing
+      hid_close(h);
+    }
+  }
+  hid_free_enumeration(list);
+  return sent;
+}
+
+bool FlashIndexRadio(const std::string& serial, const std::function<bool()>& enterDfu, const std::string& imagePath,
+                     const std::string& package, const Progress& progress, std::string* error) {
+  namespace dfu = lh::dfu;
+  // The reference init packet and the stock application: the package's application entry (manifest.json).
+  std::vector<uint8_t> manifest, dat;
+  std::string datName = "temp_app_stamped.dat", binName = "temp_app_stamped.bin";
+  if (dfu::ReadZipEntry(package, "manifest.json", &manifest)) {
+    try {
+      const auto j = nlohmann::json::parse(manifest.begin(), manifest.end());
+      datName = j.at("manifest").at("application").at("dat_file").get<std::string>();
+      binName = j.at("manifest").at("application").at("bin_file").get<std::string>();
+    } catch (...) {}
+  }
+  // The application image, linked for 0x26000: ours, or ("" path) the stock one.
+  dfu::Image image;
+  image.base = kIndexAppBase;
+  if (imagePath.empty()) {
+    if (!dfu::ReadZipEntry(package, binName, &image.data)) { *error = "SteamVR's Index radio package wasn't found"; return false; }
+  } else {
+    std::ifstream in(std::filesystem::path(std::u8string(imagePath.begin(), imagePath.end())), std::ios::binary);
+    image.data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    if (image.data.size() < 1024) { *error = "firmware not found in the firmwares folder"; return false; }
+  }
+  image.data.resize((image.data.size() + 3) & ~size_t(3), 0xFF);
+  if (package.empty() || !dfu::ReadZipEntry(package, datName, &dat)) { *error = "SteamVR's Index radio package wasn't found"; return false; }
+
+  const auto before = dfu::FindValveBootloaders();
+  const auto match = [&](const dfu::ValvePort& p) {
+    if (!serial.empty()) return Chip(p.serial) == Chip(serial);
+    return std::none_of(before.begin(), before.end(), [&](const dfu::ValvePort& b) { return b.port == p.port; });
+  };
+  std::string port;
+  for (const auto& p : before)
+    if (!serial.empty() && match(p)) port = p.port;   // already in its bootloader
+  if (port.empty()) {
+    progress(0, "Restarting the radio into its bootloader");
+    if (!enterDfu()) { *error = "couldn't reach the radio, close SteamVR and try again"; return false; }
+    for (int i = 0; i < 60 && port.empty(); ++i) {
+      Sleep(250);
+      for (const auto& p : dfu::FindValveBootloaders())
+        if (match(p)) port = p.port;
+    }
+    if (port.empty()) { *error = "the radio didn't come up in its bootloader, power cycle the headset and try again"; return false; }
+    Sleep(500);   // let the port settle
+  }
+  // Only an Index radio: its bootloader's application starts at 0x26000 and the reference is Valve's radio.
+  uint32_t version = 0, appBase = 0, hw = 0;
+  if (!dfu::ValveBootloaderInfo(port, &version, &appBase, error)) { dfu::ValveBootloaderExit(port); return false; }
+  std::vector<uint8_t> packet;
+  if (!dfu::ValveInitPacket(dat, version, image.data, &packet, &hw, error)) { dfu::ValveBootloaderExit(port); return false; }
+  if (appBase != kIndexAppBase || hw != kIndexHw) {
+    dfu::ValveBootloaderExit(port);
+    char text[128];
+    std::snprintf(text, sizeof text, "this isn't an Index radio (application at 0x%X, hardware 0x%X), nothing was written", appBase, hw);
+    *error = text;
+    return false;
+  }
+  // The version it holds: the bootloader takes the same or newer.
+  progress(0, "Flashing");
+  if (!dfu::Flash(port, image, [&](float f) { progress(f, "Flashing"); }, error, &packet)) return false;
   return true;
 }
 

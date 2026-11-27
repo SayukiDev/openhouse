@@ -28,7 +28,7 @@ def open_dev():
     want = os.environ.get("DONGLE", "")   # pick one of several: part of its name or serial
     for d in hid.enumerate(VID, PID):
         name, serial = d.get("product_string") or "", d.get("serial_number") or ""
-        if name.startswith("Doorman Dongle") and d.get("interface_number", 0) <= 0 and (want in name or want in serial):
+        if name.startswith("Doorman ") and d.get("interface_number", 0) <= 0 and (want in name or want in serial):
             return hid.Device(path=d["path"])
     sys.exit("dongle app not found (6767:0727 'Doorman Dongle')")
 
@@ -99,7 +99,7 @@ def flash(arg):
         pass   # the drive disappears when the bootloader restarts into the app
     t = time.time()
     while time.time() - t < 15:
-        if any((d.get("product_string") or "").startswith("Doorman Dongle") for d in hid.enumerate(VID, PID)):
+        if any((d.get("product_string") or "").startswith("Doorman ") for d in hid.enumerate(VID, PID)):
             time.sleep(0.3); info(); return
         time.sleep(0.3)
     sys.exit("app did not come back within 15 s (check with bootinfo / dmesg)")

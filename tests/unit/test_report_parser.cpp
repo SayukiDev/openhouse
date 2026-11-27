@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include "clock_sync.hpp"
+
 #include <cstring>
 #include <vector>
 
@@ -231,4 +233,22 @@ TEST(ButtonsParser, ReadsTheIndexControllersStateReport) {
   uint8_t counter[64] = {0x01, 0x00, 0x07, 0x3c, 0x25};
   EXPECT_TRUE(p.Parse(0, counter, sizeof counter));
   EXPECT_EQ(rec.inputs.size(), 1u);
+}
+
+// Doorman bursts: each sample arrives 1 ms plus up to a 10 ms cycle late. The window minimum is
+// the 1 ms path; the gains settle well above it.
+TEST(ClockSync, MinimumWindowFollowsTheFastestBurst) {
+  lh::usb::ClockSync gains, window;
+  window.SetMinimumWindow(true);
+  uint32_t rng = 1;
+  for (int i = 0; i < 5000; ++i) {
+    const double device = i * 0.001;
+    rng = rng * 1664525u + 1013904223u;
+    const double late = 0.001 + 0.010 * double(rng >> 8) / double(1u << 24);
+    const double host = 100.0 + device + late;
+    gains.Update(host, device);
+    window.Update(host, device);
+  }
+  EXPECT_NEAR(window.Offset(), 100.001, 0.0003);
+  EXPECT_GT(gains.Offset(), 100.002);
 }

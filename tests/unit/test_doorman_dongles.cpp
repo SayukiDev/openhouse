@@ -31,6 +31,7 @@ struct Interface {
   std::wstring serial;
   int number = 0;
   unsigned short firmware = 0x002A;   // the USB bcdDevice: five interfaces from 0x002B
+  unsigned short vid = 0x6767, pid = 0x0727;   // a Doorman Dongle unless set (Watchman: 28de:2101)
 };
 struct Handle {
   std::string path;
@@ -50,6 +51,11 @@ std::function<void()> endPass;
 std::set<std::string> hangOpens;
 int hanging = 0;                          // opens waiting in a hang now
 constexpr auto kHangCap = std::chrono::seconds(3);
+// Feature requests on a path starting with one of these hang (a wedged Watchman dongle: Windows
+// HID calls on it never return) until ReleaseFeatures(), or kFeatureHangCap at most.
+std::set<std::string> hangFeatures;
+int featureHanging = 0;
+constexpr auto kFeatureHangCap = std::chrono::seconds(15);
 
 void Reset() {
   std::lock_guard lock(m);
@@ -58,6 +64,12 @@ void Reset() {
   handles.clear();
   endPass = {};
   hangOpens.clear();
+  hangFeatures.clear();
+}
+void ReleaseFeatures() {
+  std::lock_guard lock(m);
+  hangFeatures.clear();
+  changed.notify_all();
 }
 void Hang(const std::string& prefix) {
   std::lock_guard lock(m);
@@ -86,18 +98,21 @@ void Unplug(const std::string& prefix) {
 
 extern "C" {
 int HID_API_CALL hid_init() { return 0; }
-hid_device_info* HID_API_CALL hid_enumerate(unsigned short, unsigned short) {
+hid_device_info* HID_API_CALL hid_enumerate(unsigned short vid, unsigned short pid) {
   std::lock_guard lock(fake::m);
-  fake::listed.assign(fake::plugged.size(), hid_device_info{});
-  for (size_t i = 0; i < fake::plugged.size(); ++i) {
+  std::vector<const fake::Interface*> match;
+  for (const auto& i : fake::plugged)
+    if ((vid == 0 || i.vid == vid) && (pid == 0 || i.pid == pid)) match.push_back(&i);
+  fake::listed.assign(match.size(), hid_device_info{});
+  for (size_t i = 0; i < match.size(); ++i) {
     hid_device_info& d = fake::listed[i];
-    d.path = const_cast<char*>(fake::plugged[i].path.c_str());
-    d.vendor_id = 0x6767;
-    d.product_id = 0x0727;
-    d.serial_number = const_cast<wchar_t*>(fake::plugged[i].serial.c_str());
+    d.path = const_cast<char*>(match[i]->path.c_str());
+    d.vendor_id = match[i]->vid;
+    d.product_id = match[i]->pid;
+    d.serial_number = const_cast<wchar_t*>(match[i]->serial.c_str());
     d.product_string = const_cast<wchar_t*>(L"Doorman Dongle Pro Micro");   // board-named, matched by prefix
-    d.interface_number = fake::plugged[i].number;
-    d.release_number = fake::plugged[i].firmware;
+    d.interface_number = match[i]->number;
+    d.release_number = match[i]->firmware;
     d.next = i + 1 < fake::listed.size() ? &fake::listed[i + 1] : nullptr;
   }
   return fake::listed.empty() ? nullptr : fake::listed.data();
@@ -126,8 +141,17 @@ void HID_API_CALL hid_close(hid_device* d) {
 }
 int HID_API_CALL hid_set_nonblocking(hid_device*, int) { return 0; }
 int HID_API_CALL hid_send_feature_report(hid_device* d, const unsigned char* data, size_t n) {
-  std::lock_guard lock(fake::m);
+  std::unique_lock lock(fake::m);
   auto* h = reinterpret_cast<fake::Handle*>(d);
+  const auto hangs = [&] {
+    return std::any_of(fake::hangFeatures.begin(), fake::hangFeatures.end(),
+                       [&](const std::string& p) { return h->path.rfind(p, 0) == 0; });
+  };
+  if (hangs()) {
+    ++fake::featureHanging;
+    if (!fake::changed.wait_for(lock, fake::kFeatureHangCap, [&] { return !hangs(); })) fake::hangFeatures.clear();
+    --fake::featureHanging;
+  }
   if (h->gone) return -1;
   h->written.emplace_back(data, data + n);
   return int(n);
@@ -194,6 +218,7 @@ struct UsbTransportTestAccess {
     fake::endPass = {};
   }
   static RawCaptureWriter& Capture(UsbTransport& t) { return t.capture_; }
+  static constexpr int kOpenDeadlineMs = UsbTransport::kOpenDeadlineMs;
 };
 }  // namespace lh::usb
 
@@ -218,9 +243,17 @@ struct Sink : lh::InputSinkBase {
     detached.push_back(id);
     if (transport) transport->OnDeviceGone(id);
   }
-  void OnTransportLog(lh::LogLevel, const std::string& text) override { logs.push_back(text); }
-  size_t Count(const std::string& line) const { return size_t(std::count(logs.begin(), logs.end(), line)); }
+  mutable std::mutex logMutex;   // the transport's threads log too
+  void OnTransportLog(lh::LogLevel, const std::string& text) override {
+    std::lock_guard lock(logMutex);
+    logs.push_back(text);
+  }
+  size_t Count(const std::string& line) const {
+    std::lock_guard lock(logMutex);
+    return size_t(std::count(logs.begin(), logs.end(), line));
+  }
   size_t CountContaining(const std::string& part) const {
+    std::lock_guard lock(logMutex);
     return size_t(std::count_if(logs.begin(), logs.end(), [&](const auto& l) { return l.find(part) != std::string::npos; }));
   }
 };
@@ -992,4 +1025,77 @@ TEST_F(Doorman, ADongleThatOpensWhileUnpluggedOrStoppedIsNotSetUp) {
   EXPECT_EQ(sink.Count("Doorman Dongle OHDG-TESTB opened"), 0u);
   std::lock_guard lock(fake::m);
   for (const auto& h : fake::handles) EXPECT_TRUE(h->closed) << h->path;
+}
+
+// A Watchman dongle that stopped answering (#149's case: two processes' device-info requests at
+// once wedged it, and every HID call on it then waited): starting must not wait for it, or
+// SteamVR aborts the driver while it loads. The others are set up right away, it's not opened a
+// second time while it's stuck, and once it answers it's taken like a dongle plugged in later.
+TEST_F(Doorman, AWedgedWatchmanDongleDoesNotHoldUpStarting) {
+#ifdef _WIN32
+  GTEST_SKIP() << "Windows lists Valve devices with SetupDi (hid_list.cpp), not through the fake hidapi";
+#endif
+  const double kDeadline = Access::kOpenDeadlineMs;
+  fake::plugged.push_back({"WOK0", L"WOKDONGLE", 0, 0, 0x28de, 0x2101});
+  fake::plugged.push_back({"WHUNG0", L"WHUNGDONGLE", 0, 0, 0x28de, 0x2101});
+  {
+    std::lock_guard lock(fake::m);
+    fake::hangFeatures.insert("WHUNG");
+  }
+  const auto receivers = [&] {
+    std::set<std::string> out;
+    for (const auto& r : transport->Receivers()) out.insert(r.serial);
+    return out;
+  };
+  const auto start = std::chrono::steady_clock::now();
+  ASSERT_TRUE(transport->Start());
+  const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  EXPECT_LT(took, kDeadline / 1000.0 + 1.0) << "Start waited for the wedged dongle";
+  EXPECT_GT(took, kDeadline / 1000.0 - 0.5);   // it did wait, up to the deadline
+  EXPECT_TRUE(receivers().count("WOKDONGLE"));
+  EXPECT_FALSE(receivers().count("WHUNGDONGLE"));
+  EXPECT_GT(sink.CountContaining("WHUNGDONGLE (WHUNG0) isn't answering"), 0u);
+  // The probe thread keeps listing devices meanwhile: the stuck one isn't opened again.
+  std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+  EXPECT_EQ(HandlesOf("WHUNG"), 1u);
+  {
+    std::lock_guard lock(fake::m);
+    EXPECT_EQ(fake::featureHanging, 1);
+  }
+  // It answers again: picked up without a replug.
+  fake::ReleaseFeatures();
+  bool back = false;
+  for (int i = 0; i < 100 && !back; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // Listed once its open finishes, then handed over on the probe thread's next pass.
+    back = receivers().count("WHUNGDONGLE") > 0 && sink.CountContaining("answering now (WHUNG0)") > 0;
+  }
+  EXPECT_TRUE(back);
+  EXPECT_GT(sink.CountContaining("answering now (WHUNG0)"), 0u);
+  EXPECT_EQ(HandlesOf("WHUNG"), 1u);
+  transport->Stop();
+  std::lock_guard lock(fake::m);
+  for (const auto& h : fake::handles) EXPECT_TRUE(h->closed) << h->path;
+}
+
+// One still stuck when the transport stops: Stop doesn't wait forever, and what it opens after is
+// closed.
+TEST_F(Doorman, AWedgedWatchmanDongleDoesNotHoldUpStopping) {
+#ifdef _WIN32
+  GTEST_SKIP() << "Windows lists Valve devices with SetupDi (hid_list.cpp), not through the fake hidapi";
+#endif
+  fake::plugged.push_back({"WHUNG0", L"WHUNGDONGLE", 0, 0, 0x28de, 0x2101});
+  {
+    std::lock_guard lock(fake::m);
+    fake::hangFeatures.insert("WHUNG");
+  }
+  ASSERT_TRUE(transport->Start());
+  const auto start = std::chrono::steady_clock::now();
+  transport->Stop();
+  const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  EXPECT_LT(took, 6.0);
+  fake::ReleaseFeatures();
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  std::lock_guard lock(fake::m);
+  EXPECT_EQ(fake::featureHanging, 0);
 }

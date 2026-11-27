@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "report_parser.hpp"
 
 #include <algorithm>
@@ -34,6 +36,15 @@ T Rd(const uint8_t* p) {
 
 // ---------------------------------------------------------------- IMU
 
+
+namespace {
+// LH_CLOCK_TRACE=file (measuring): each IMU report's host arrival and its newest sample's device time.
+void ClockTrace(const std::string& who, double hostTime, double deviceTime) {
+  static std::FILE* f = [] { const char* p = std::getenv("LH_CLOCK_TRACE"); return p ? std::fopen(p, "w") : nullptr; }();
+  if (f) std::fprintf(f, "%s %.6f %.6f\n", who.c_str(), hostTime, deviceTime);
+}
+}  // namespace
+
 bool ImuReportParser::Parse(double hostTime, const uint8_t* data, size_t len, bool lastInBatch) {
   if (len < 1) return false;
   if (data[0] != 0x20) return false;  // wireless (0x23/0x24...) handled elsewhere
@@ -52,6 +63,7 @@ bool ImuReportParser::Parse(double hostTime, const uint8_t* data, size_t len, bo
     // Original re-unwraps here; the value is identical since the reference only advanced.
     const int64_t t = dev_->ticks.Unwrap(Rd<uint32_t>(data + 1 + 17 * i + 12), 32);
     if (!imu_.IsNew(t)) continue;
+    if (k == 2) ClockTrace(dev_->id, hostTime, double(t) * kTick);
     if (k == 2 && lastInBatch) {
       dev_->clock.Update(hostTime - 0.0009, double(t) * kTick);
       sink_->OnClockOffset(dev_->id, dev_->clock.Offset());
@@ -313,6 +325,7 @@ bool WirelessReportParser::Parse(double hostTime, const uint8_t* data, size_t le
   }
   // Original syncs with the last decoded IMU timestamp (uninitialized if the packet had
   // no IMU); we only sync when one was present.
+  if (ticks != INT64_MIN) ClockTrace(dev_->id, hostTime, double(ticks) * kTick);
   if (sync && ticks != INT64_MIN) {
     dev_->clock.Update(hostTime - 0.0044, double(ticks) * kTick);  // 0x1a99c8
     sink_->OnClockOffset(dev_->id, dev_->clock.Offset());

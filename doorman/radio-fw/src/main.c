@@ -839,6 +839,26 @@ static void addr_check(void)
 }
 static uint32_t period_us = 2000, t_addr, t_last_poll;    /* cycle period (from POLLs), poll timing */
 #ifndef DML_MULTI
+/* Late answers. Built right after an exchange, an answer waited the whole cycle for the next poll, and data
+   that came meanwhile waited for the answer after it: up to two cycles old, and cycles grow with the devices on
+   the dongle. Instead the radio listens without an answer and builds it LATE_LEAD_US before the poll is due,
+   from the shortest gap between its polls lately (poll_gap_min: follows a shorter cycle at once, a longer one
+   slowly, so it's early rather than late). A poll that still comes first gets no answer (as a lost exchange:
+   the dongle polls again) and the answer is armed at once. */
+#define LATE_LEAD_US 300u                                  /* the least lead; it grows by 100 us for each poll */
+#define LATE_LEAD_MAX 3000u                                /* that came before the answer was armed (the nRF51's */
+static uint32_t poll_gap_min, late_at, late_lead = LATE_LEAD_US;   /* slower radio and build need more), */
+                                                           /* and shrinks 1 us an exchange while none do */
+/* Off on the HTC radios (nRF51): with it on they lost 4-5 points more of their answers (early polls were only
+   about one of those, so the slower radio re-arming mid-cycle costs the rest), against ~0.5 on the Index
+   family. Air 'A' switches it either way. */
+#ifdef DML_IDX
+static uint8_t late_armed, late_off;
+#else
+static uint8_t late_armed, late_off = 1;
+#endif
+#endif
+#ifndef DML_MULTI
 static uint8_t max_resp = DML_MAXLEN;
 #endif
 static uint32_t rng = 0x12345678u;
@@ -988,8 +1008,20 @@ static void batch_push(const uint8_t *f, uint8_t n)
   addr_check();
 }
 #endif
+#ifdef DML_IDX
+/* Latency counters (air 'I', cleared by each read): 500 us buckets, the last open-ended. gap: between IMU
+   samples from the main MCU; age: the newest IMU sample an answer carries, when the answer has gone out;
+   wait: from building that answer to it going out. */
+static uint32_t imu_last;
+static uint32_t pb_imu_t[3], pb_built_t[3];
+static uint16_t h_gap[8], h_age[8], h_wait[8];
+static void hist(uint16_t *h, uint32_t us) { uint32_t b = us / 500u; h[b > 7 ? 7 : b]++; }
+#endif
 static void uplink_push(const uint8_t *f, uint8_t n)
 {
+#ifdef DML_IDX
+  if (n == 18 && f[0] == 'p') { const uint32_t t = now_us(); if (imu_last) hist(h_gap, t - imu_last); imu_last = t; }
+#endif
   static uint8_t tagged[80];                               /* answers are up to 64 B, 65 tagged */
   if (n && f[0] == 'P' && n < sizeof tagged) {             /* answer to a tagged read: give it its tag */
     while (tq_n && now_us() - tq_t[tq_head] > 500000u) { tq_head = (uint8_t)((tq_head + 1) % TQ); tq_n--; }
@@ -1207,6 +1239,9 @@ static void go_joined(uint32_t base, uint8_t slot, uint8_t check, uint8_t batch)
   bq_n = 0;
 #endif
   on = 0; send_i = 0; next_seq = 0; last_dseq = 1; have_cycle = 0;
+#ifndef DML_MULTI
+  poll_gap_min = 0; late_armed = 0; late_lead = LATE_LEAD_US;
+#endif
   sent_max = 7;                    /* nothing sent yet: the dongle acks 7 until it has our seq 0 */
   mask = 0xFFFF; cur_ch = dml_hop_ch[0]; period_us = 2000; max_resp = DML_MAXLEN;
   last_poll_us = now_us();
@@ -1256,6 +1291,9 @@ static uint8_t build_new(void)                             /* fill a free buffer
 #endif
   }
   pb[b][0] = (uint8_t)len;
+#if defined(DML_IDX) && !defined(DML_MULTI)
+  if (b < 3) { pb_imu_t[b] = imu_last; pb_built_t[b] = now_us(); }
+#endif
   p[0] = DML_RESP; p[1] = my_slot; p[2] = (uint8_t)((next_seq & DML_F_SEQ_MASK) | (uq_used() ? DML_F_MORE : 0));
   next_seq = (next_seq + 1) & DML_F_SEQ_MASK;
   ob[on++] = b;
@@ -1272,9 +1310,30 @@ static void arm_prepare(void)                              /* pick what the next
   p[3] = poll_rssi; p[4] = poll_missed; p[5] = poll_crc_err;
   armed = b;
 }
-static void arm_next(void) { arm_prepare(); arm_rx(1); }   /* ... then listen */
+static void arm_next(void)                                 /* ... then listen */
+{
+#ifndef DML_MULTI
+  late_armed = 0;
+#endif
+  arm_prepare(); arm_rx(1);
+}
+/* After an exchange: a new answer is built late (see LATE_LEAD_US); a resend has nothing newer to take. */
+static void arm_after_exchange(void)
+{
+#ifndef DML_MULTI
+  if (late_lead > LATE_LEAD_US) late_lead--;
+  if (!late_off && send_i >= on && on < 2 && have_cycle && poll_gap_min > late_lead + 200u) {
+    late_at = t_last_poll + poll_gap_min - late_lead;
+    if ((int32_t)(now_us() - late_at) < 0) { late_armed = 1; arm_rx(0); return; }
+  }
+#endif
+  arm_next();
+}
 static void exchange_done(void)                            /* our RESP pb[armed] just went out */
 {
+#if defined(DML_IDX) && !defined(DML_MULTI)
+  if (armed < 3 && pb_imu_t[armed]) { const uint32_t t = now_us(); hist(h_age, t - pb_imu_t[armed]); hist(h_wait, t - pb_built_t[armed]); }
+#endif
   if (poll_ok) {                                           /* drop everything the poll acknowledged */
     while (on && ((poll_ack - (pb[ob[0]][3] & DML_F_SEQ_MASK)) & 7) < 4) {
       ob[0] = ob[1]; ob[1] = ob[2]; on--;
@@ -1333,6 +1392,22 @@ static void air_update(const uint8_t *f, uint8_t n)
     air_reply(x, 4); return;
   }
 #endif
+#if defined(DML_IDX) && !defined(DML_MULTI)
+  case 'I': {                                              /* latency counters: gap[8] age[8] wait[8], u16 each */
+    uint8_t x[50] = { DML_AIR_UPD, 'I' };
+    memcpy(x + 2, h_gap, 16); memcpy(x + 18, h_age, 16); memcpy(x + 34, h_wait, 16);
+    memset(h_gap, 0, 16); memset(h_age, 0, 16); memset(h_wait, 0, 16);
+    air_reply(x, 50); return;
+  }
+#endif
+#ifndef DML_MULTI
+  case 'A': {                                              /* late answers: [1 on / 0 off / other: just ask] -> on, lead us */
+    if (n > 2 && f[2] <= 1) late_off = (uint8_t)!f[2];
+    uint8_t x[6] = { DML_AIR_UPD, 'A', (uint8_t)!late_off };
+    memcpy(x + 3, &late_lead, 2); x[5] = 0;
+    air_reply(x, 6); return;
+  }
+#endif
   case 'T': {                                              /* link timing (lt) */
     uint8_t x[40] = { DML_AIR_UPD, 'T' };
     memcpy(x + 2, &lt, sizeof lt);
@@ -1374,6 +1449,13 @@ static void air_update(const uint8_t *f, uint8_t n)
 __attribute__((noipa)) static void handle_poll(const uint8_t *p, int len)   /* noinline: radio_emu calls it */
 {
   uint8_t cyc = p[3];
+#ifndef DML_MULTI
+  if (have_cycle && (uint8_t)(cyc - last_cycle) == 1) {    /* the gap to the previous poll, one cycle */
+    const uint32_t gap = t_addr - t_last_poll;
+    if (!poll_gap_min || gap < poll_gap_min) poll_gap_min = gap;
+    else poll_gap_min += 2;                                /* ~0.4 ms/s back up after a cycle got longer */
+  }
+#endif
   if (have_cycle) poll_missed += (uint8_t)(cyc - last_cycle - 1);
   last_cycle = cyc; have_cycle = 1;
   poll_rssi = (uint8_t)NRF_RADIO->RSSISAMPLE;
@@ -1435,13 +1517,18 @@ static void radio_poll(void)
     if (multi_hop) for (int k = 0; k < ninst; k++) if (inst[k].m_joined) { D = &inst[k]; break; }   /* hop on any joined slot's view */
 #endif
     if (joined && t - last_poll_us > 1000000) go_unjoined();          /* dongle gone */
+#ifndef DML_MULTI
+    else if (joined && late_armed && rstate == R_RX && !heard && (int32_t)(t - late_at) >= 0) {
+      radio_stop(); arm_next();                            /* the poll is close: build the answer now */
+    }
+#endif
     else if (joined && have_cycle && rstate == R_RX && !heard) {
       /* missed polls: keep hopping on our own clock. The poll for cycle last+j is due at
          t_last_poll + j*P; be on its channel from half a period before until half after. */
       uint32_t j = (t - t_last_poll + period_us / 2) / period_us;
       if (j >= 1) {
         uint8_t ch = dml_channel((uint8_t)(last_cycle + j), mask);
-        if (ch != cur_ch) { radio_stop(); cur_ch = ch; arm_next(); }
+        if (ch != cur_ch) { radio_stop(); cur_ch = ch; arm_next(); }   /* (a late answer is armed now too) */
       }
     }
     return;
@@ -1467,7 +1554,12 @@ static void radio_poll(void)
         arm_next(); return;
       }
 #endif
-      if (!got_addr) { lt.no_answer++; radio_stop(); arm_next(); return; } /* never answer with the wrong buffer */
+      if (!got_addr) {                                     /* never answer with the wrong buffer */
+#ifndef DML_MULTI
+        if (late_armed && late_lead < LATE_LEAD_MAX) late_lead += 100u;   /* the poll came before the answer */
+#endif
+        lt.no_answer++; radio_stop(); arm_next(); return;
+      }
       poll_ok = crc && len >= DML_POLL_HDR && p[0] == DML_POLL && p[1] == my_slot;
       if (!crc) poll_crc_err++;
       if (poll_ok) handle_poll(p, len);
@@ -1511,7 +1603,7 @@ static void radio_poll(void)
     return;
   }
   /* R_TX finished */
-  if (joined) { exchange_done(); arm_next(); }
+  if (joined) { exchange_done(); arm_after_exchange(); }
   else arm_rx(answer_join);
 }
 

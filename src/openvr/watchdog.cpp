@@ -15,6 +15,7 @@
 #include "watchdog.hpp"
 
 #include "../platform/platform.hpp"
+#include "../transport/usb/hid_list.hpp"
 #include "../transport/usb/usb_transport.hpp"
 
 #include <hidapi/hidapi.h>
@@ -36,9 +37,9 @@ constexpr uint16_t kValve = 0x28de;
 bool IsReceiver(uint16_t pid) { return pid == 0x2101 || pid == 0x2102; }
 bool IsWired(uint16_t pid) { return pid == 0x2000 || pid == 0x2012 || pid == 0x2022 || pid == 0x2300; }
 
-std::string Narrow(const wchar_t* s) {
+std::string Narrow(const std::wstring& w) {
   std::string out;
-  for (; s && *s; ++s) out += *s < 0x80 ? char(*s) : '?';
+  for (wchar_t c : w) out += c < 0x80 ? char(c) : '?';
   return out;
 }
 
@@ -61,10 +62,7 @@ class Watchdog final : public IVRWatchdogProvider {
   void Cleanup() override {
     stop_ = true;
     if (thread_.joinable()) thread_.join();
-    for (auto& [path, r] : receivers_)
-      if (r.dev) hid_close(r.dev);
-    receivers_.clear();
-    wired_.clear();
+    LetGo();
     CleanupDriverContext();
   }
 
@@ -74,46 +72,66 @@ class Watchdog final : public IVRWatchdogProvider {
     bool connected = false;
   };
 
+  // While SteamVR runs, its driver has the dongles: none of them is asked anything from here (two
+  // processes' device-info requests at once wedge a dongle), and the handles are let go. Steam
+  // keeps the watchdog loaded through SteamVR sessions, without Cleanup().
+  void LetGo() {
+    for (auto& [path, r] : receivers_)
+      if (r.dev) hid_close(r.dev);
+    receivers_.clear();
+    wired_.clear();
+  }
+
   void Main() {
     bool first = true;
     while (!stop_) {
-      Poll(first);
-      first = false;
+      bool polled = false;
+      if (!lh::platform::VrserverRunning()) {
+        lh::platform::DongleQueryLock lock;   // the driver starting in vrserver waits for it
+        if (lock.Acquire(std::chrono::milliseconds(0)) && !lh::platform::VrserverRunning()) {
+          Poll(first);
+          polled = true;
+        }
+      }
+      if (polled) {
+        first = false;
+      } else {
+        LetGo();
+        first = true;   // what's there once SteamVR closes was there with it: not a wake-up
+      }
       for (int i = 0; i < 10 && !stop_; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
   }
 
   void Poll(bool first) {
     std::set<std::string> seenReceivers, seenWired;
-    hid_device_info* list = hid_enumerate(kValve, 0);
-    for (hid_device_info* d = list; d; d = d->next) {
-      if (!d->path) continue;
-      const std::string path = d->path;
-      if (IsReceiver(d->product_id) && d->interface_number == 0) {
+    for (const lh::usb::HidEntry& entry : lh::usb::ListHid(kValve)) {
+      const lh::usb::HidEntry* d = &entry;
+      const std::string& path = d->path;
+      if (IsReceiver(d->pid) && d->iface == 0) {
         seenReceivers.insert(path);
         if (!receivers_.count(path)) {
           Receiver r;
-          r.dev = hid_open_path(d->path);
+          r.dev = hid_open_path(path.c_str());
           if (!r.dev) continue;
           // A receiver plugged in after start counts from its first answer, as one at start.
           if (const auto s = lh::usb::UsbTransport::ConnectedSerial(r.dev)) r.connected = *s != 0;
           receivers_[path] = r;
         }
-      } else if (IsWired(d->product_id) && d->interface_number == 0) {
+      } else if (IsWired(d->pid) && d->iface == 0) {
         seenWired.insert(path);
         if (!first && !wired_.count(path)) {
-          const std::string serial = Narrow(d->serial_number);
+          const std::string serial = Narrow(d->serial);
           const std::string config =
               serial.empty() ? std::string() : lh::usb::UsbTransport::LoadSteamConfig(lh::platform::SteamConfigDirectory(), serial);
           if (WiredPlugInWakes(config)) {
-            Wake(d->product_id == 0x2000 ? TrackedDeviceClass_HMD : TrackedDeviceClass_Controller);
+            Wake(d->pid == 0x2000 ? TrackedDeviceClass_HMD : TrackedDeviceClass_Controller);
           } else if (VRDriverLog()) {
             VRDriverLog()->Log(("lh: [INFO] watchdog: " + serial + " plugged in, a controller or tracker charging: not starting SteamVR\n").c_str());
           }
         }
       }
     }
-    hid_free_enumeration(list);
     wired_ = seenWired;
     for (auto it = receivers_.begin(); it != receivers_.end();) {
       if (!seenReceivers.count(it->first)) {
