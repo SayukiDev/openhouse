@@ -1,0 +1,97 @@
+# Builds the packages (build.yml's jobs, unchanged) and publishes them as a GitHub release of this
+# repository. Manual only: Actions -> release -> Run workflow, on the branch to release, with the tag
+# to create.
+#
+# The version in the binaries is build.yml's rule, not the tag: a run started by the repository
+# owner is a release build (the plain version from include/lh/version.hpp), anyone else's has the
+# commit in it. Signing (SignPath) only runs in the upstream repository, so these packages are unsigned.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to create for the release (e.g. v1.0.4-hop.1). It must not exist yet.
+        required: true
+        type: string
+      prerelease:
+        description: Mark as a pre-release
+        type: boolean
+        default: false
+      draft:
+        description: Create as a draft (published by hand afterwards)
+        type: boolean
+        default: false
+
+# One release at a time for a tag; a second run with the same tag waits and then fails the tag check.
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  # Before the long build: the tag is a sane name and isn't taken (a release on an existing tag
+  # would point at that tag's commit, not at what was built).
+  check:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Tag is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.+-]+)?$ ]]; then
+            echo "::error::tag '$TAG' doesn't look like a version (v1.2.3 or v1.2.3-something)"; exit 1
+          fi
+          # 404: free. 200: taken. Anything else (the API failing) stops here too.
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG")
+          case "$code" in
+            404) echo "tag '$TAG' is free" ;;
+            200) echo "::error::tag '$TAG' already exists in $GITHUB_REPOSITORY"; exit 1 ;;
+            *) echo "::error::couldn't tell whether tag '$TAG' exists (HTTP $code)"; exit 1 ;;
+          esac
+
+  build:
+    needs: check
+    uses: ./.github/workflows/build.yml
+    # What build.yml's jobs ask for (windows-signed names these, also when it's skipped).
+    permissions:
+      actions: read
+      contents: read
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: openhouse-linux-x64
+          path: packages
+      - uses: actions/download-artifact@v4
+        with:
+          name: openhouse-windows-x64
+          path: packages
+      - name: Checksums
+        working-directory: packages
+        run: |
+          ls -l
+          test -f openhouse-linux-x64.tar.gz && test -f openhouse-windows-x64.zip
+          sha256sum openhouse-linux-x64.tar.gz openhouse-windows-x64.zip | tee SHA256SUMS.txt
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          flags=()
+          [[ "$PRERELEASE" == true ]] && flags+=(--prerelease)
+          [[ "$DRAFT" == true ]] && flags+=(--draft)
+          # --target: the tag is created on the commit that was built.
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "openhouse $TAG" --generate-notes "${flags[@]}" \
+            packages/openhouse-linux-x64.tar.gz packages/openhouse-windows-x64.zip packages/SHA256SUMS.txt

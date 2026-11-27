@@ -7,6 +7,8 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  # release.yml runs these same jobs and publishes their packages.
+  workflow_call:
 
 # A newer push to the same branch or pull request cancels the run still going. Manual runs
 # (release builds, signed) are never cancelled: they wait up to 2 h for approval in SignPath.
