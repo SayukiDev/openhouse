@@ -15,7 +15,10 @@
 #endif
 #include <windows.h>
 #include <cfgmgr32.h>
+// Older mingw-w64 hidsdi.h has no extern "C" guard, so HidD_* would get C++ linkage and fail to link.
+extern "C" {
 #include <hidsdi.h>
+}
 #include <setupapi.h>
 #endif
 
